@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -30,6 +31,8 @@ type InstanceGroup struct {
 	UseIgnition      bool          `json:"use_ignition"`      // Configure keys via Ignition (Fedora CoreOS / Flatcar)
 	BootTimeS        string        `json:"boot_time"`         // optional: wait some time before report machine as available
 	BootTime         time.Duration
+	VolumeType       string `json:"volume_type"`
+	VolumeSize       int    `json:"volume_size"`
 
 	client          openstackclient.Client
 	settings        provider.Settings
@@ -68,6 +71,14 @@ func (g *InstanceGroup) Init(ctx context.Context, log hclog.Logger, settings pro
 		}
 
 		g.imgProps.Store(imgProps)
+	}
+
+	if g.VolumeSize != 0 && g.VolumeType != "" {
+		if slices.ContainsFunc(g.ServerSpec.BlockDevice, func(blockDevice servers.BlockDevice) bool {
+			return blockDevice.BootIndex == 0
+		}) {
+			return provider.ProviderInfo{}, fmt.Errorf("volume_size and volume_type can only be specified if there is no server_spec.block_device_mapping_v2 with boot_index set to 0")
+		}
 	}
 
 	// log.With("creds", settings, "image", g.imgProps).Info("settings 1")
@@ -258,6 +269,18 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 		if err != nil {
 			return "", err
 		}
+	}
+
+	if g.VolumeSize != 0 && g.VolumeType != "" {
+		spec.BlockDevice = append(spec.BlockDevice, servers.BlockDevice{
+			BootIndex:           0,
+			DeleteOnTermination: true,
+			DestinationType:     servers.DestinationVolume,
+			SourceType:          servers.SourceImage,
+			UUID:                spec.ImageRef,
+			VolumeSize:          g.VolumeSize,
+			VolumeType:          g.VolumeType,
+		})
 	}
 
 	if spec.ImageName != "" {

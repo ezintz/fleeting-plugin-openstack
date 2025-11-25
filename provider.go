@@ -264,13 +264,6 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 		hintOpts = spec.SchedulerHints
 	}
 
-	if g.UseIgnition {
-		err := InsertSSHKeyIgn(spec, g.settings.Username, g.sshPubKey)
-		if err != nil {
-			return "", err
-		}
-	}
-
 	if spec.ImageName != "" {
 		imageRef, imgProps, err := g.client.GetImageByName(ctx, spec.ImageName)
 		if err != nil {
@@ -281,6 +274,22 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 		g.imgProps.Store(imgProps)
 
 		g.log.Debug("Image resolved by name", "image_name", spec.ImageName, "image_ref", spec.ImageRef)
+	}
+
+	if g.UseIgnition {
+		username := g.settings.Username
+		if username == "" {
+			imgProps := g.imgProps.Load()
+			if imgProps.OSAdminUser == "" {
+				return "", fmt.Errorf("image properties 'os_admin_user' and 'runners.autoscaler.connector_config.username' missing. Ensure one is set.")
+			}
+			username = imgProps.OSAdminUser
+		}
+
+		err := InsertSSHKeyIgn(spec, username, g.sshPubKey)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	// Pre-create Neutron ports for networks that specify a SubnetID.

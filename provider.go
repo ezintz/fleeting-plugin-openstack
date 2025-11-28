@@ -276,6 +276,17 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 		g.log.Debug("Image resolved by name", "image_name", spec.ImageName, "image_ref", spec.ImageRef)
 	}
 
+	if spec.FlavorName != "" {
+		flavorRef, err := g.client.GetFlavorByName(ctx, spec.FlavorName)
+		if err != nil {
+			return "", err
+		}
+
+		spec.FlavorRef = flavorRef
+
+		g.log.Debug("Flavor resolved by name", "flavor_name", spec.FlavorName, "flavor_ref", spec.FlavorRef)
+	}
+
 	if g.UseIgnition {
 		username := g.settings.Username
 		if username == "" {

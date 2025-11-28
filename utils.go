@@ -37,6 +37,9 @@ type ExtCreateOpts struct {
 	// search for imageRef by name each time
 	ImageName string `json:"image_name,omitempty"`
 
+	// search for flavorRef by name each time
+	FlavorName string `json:"flavor_name,omitempty"`
+
 	// annotation overrides
 	Networks       []PluginNetwork            `json:"networks,omitempty"`
 	SecurityGroups []string                   `json:"security_groups,omitempty"`

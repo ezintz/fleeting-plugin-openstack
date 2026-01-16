@@ -3,9 +3,11 @@ package openstackclient
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"slices"
+	"time"
 
 	"github.com/caarlos0/env/v11"
 	"github.com/go-viper/mapstructure/v2"
@@ -79,6 +81,7 @@ type ImageProperties struct {
 type Client interface {
 	GetImageProperties(ctx context.Context, imageRef string) (*ImageProperties, error)
 	GetImageByName(ctx context.Context, imageName string) (string, *ImageProperties, error)
+	GetImageByMetadata(ctx context.Context, imageIdMetadataKey string) (string, *ImageProperties, error)
 	GetFlavorByName(ctx context.Context, flavorName string) (string, error)
 	ShowServerConsoleOutput(ctx context.Context, serverId string) (string, error)
 	GetServer(ctx context.Context, serverId string) (*servers.Server, error)
@@ -296,6 +299,41 @@ func (c *client) GetImageByName(ctx context.Context, imageName string) (string, 
 	}
 
 	return imgs[0].ID, out, nil
+}
+
+func (c *client) GetImageByMetadata(ctx context.Context, imageRefMetadataKey string) (string, *ImageProperties, error) {
+	http := http.Client{Timeout: 10 * time.Second}
+	response, err := http.Get("http://169.254.169.254/openstack/latest/meta_data.json")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to query metadata service: %w", err)
+	}
+	defer response.Body.Close()
+
+	var metadata struct {
+		Meta map[string]string `json:"meta,omitempty"`
+	}
+	err = json.NewDecoder(response.Body).Decode(&metadata)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to decode metadata json: %w", err)
+	}
+
+	imageId, ok := metadata.Meta[imageRefMetadataKey]
+	if !ok {
+		return "", nil, fmt.Errorf("the metadata does not contain an entry with the name: %s", imageRefMetadataKey)
+	}
+
+	image, err := images.Get(ctx, c.image, imageId).Extract()
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to parse image: %w", err)
+	}
+
+	out := new(ImageProperties)
+	err = mapstructure.Decode(image.Properties, out)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to parse properties: %w", err)
+	}
+
+	return image.ID, out, nil
 }
 
 func (c *client) GetFlavorByName(ctx context.Context, flavorName string) (string, error) {

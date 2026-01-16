@@ -37,6 +37,9 @@ type ExtCreateOpts struct {
 	// search for imageRef by name each time
 	ImageName string `json:"image_name,omitempty"`
 
+	// search for imageRef by metadata each time
+	ImageRefFromMetadata string `json:"image_ref_from_metadata,omitempty"`
+
 	// search for flavorRef by name each time
 	FlavorName string `json:"flavor_name,omitempty"`
 

@@ -274,6 +274,16 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 		g.imgProps.Store(imgProps)
 
 		g.log.Debug("Image resolved by name", "image_name", spec.ImageName, "image_ref", spec.ImageRef)
+	} else if spec.ImageRefFromMetadata != "" {
+		imageRef, imgProps, err := g.client.GetImageByMetadata(ctx, spec.ImageRefFromMetadata)
+		if err != nil {
+			return "", err
+		}
+
+		spec.ImageRef = imageRef
+		g.imgProps.Store(imgProps)
+
+		g.log.Debug("Image resolved by metadata", "image_name", spec.ImageName, "image_ref", spec.ImageRef)
 	}
 
 	if spec.FlavorName != "" {

@@ -410,6 +410,9 @@ outputs:
   network_id:
     description: Network
     value: {get_resource: runner_net}
+  subnet_id:
+    description: Subnet
+    value: {get_resource: runner_subnet}
   gitlab_sg:
     description: Security Group
     value: {get_resource: allow_gitlab_runner}

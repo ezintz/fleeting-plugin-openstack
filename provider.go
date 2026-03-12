@@ -17,6 +17,7 @@ import (
 )
 
 const MetadataKey = "fleeting-cluster"
+const PortDescription = "fleeting-plugin-openstack"
 
 var _ provider.InstanceGroup = (*InstanceGroup)(nil)
 
@@ -181,6 +182,20 @@ func (g *InstanceGroup) Decrease(ctx context.Context, instances []string) (succe
 
 	succeeded = make([]string, 0, len(instances))
 	for _, id := range instances {
+		// Collect pre-created ports (identified by description) before
+		// deleting the server, so we can clean them up afterwards.
+		var portIDs []string
+		serverPorts, listErr := g.client.ListPortsByDeviceID(ctx, id)
+		if listErr != nil {
+			g.log.Warn("Failed to list ports for server", "id", id, "err", listErr)
+		} else {
+			for _, p := range serverPorts {
+				if p.Description == PortDescription {
+					portIDs = append(portIDs, p.ID)
+				}
+			}
+		}
+
 		err2 := g.client.DeleteServer(ctx, id)
 		if err2 != nil {
 			g.log.Error("Failed to delete instance", "err", err2, "id", id)
@@ -188,6 +203,9 @@ func (g *InstanceGroup) Decrease(ctx context.Context, instances []string) (succe
 		} else {
 			g.log.Info("Instance deletion request successful", "id", id)
 			succeeded = append(succeeded, id)
+
+			// Clean up pre-created ports after successful server deletion.
+			g.cleanupPorts(ctx, portIDs)
 		}
 	}
 
@@ -254,12 +272,41 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 		g.log.Debug("Image resolved by name", "image_name", spec.ImageName, "image_ref", spec.ImageRef)
 	}
 
+	// Pre-create Neutron ports for networks that specify a SubnetID.
+	// Nova does not support subnet_id directly, so we create a port on the
+	// desired subnet and pass the port ID to Nova instead.
+	var createdPortIDs []string
+	for i, net := range spec.Networks {
+		if net.SubnetID != "" {
+			port, err := g.client.CreatePort(ctx, net.UUID, net.SubnetID, PortDescription)
+			if err != nil {
+				g.cleanupPorts(ctx, createdPortIDs)
+				return "", fmt.Errorf("failed to create port for subnet %s: %w", net.SubnetID, err)
+			}
+
+			createdPortIDs = append(createdPortIDs, port.ID)
+			g.log.Debug("Pre-created port for subnet", "port_id", port.ID, "network_id", net.UUID, "subnet_id", net.SubnetID)
+
+			spec.Networks[i] = PluginNetwork{Port: port.ID, Tag: net.Tag}
+		}
+	}
+
 	srv, err := g.client.CreateServer(ctx, spec, hintOpts)
 	if err != nil {
+		g.cleanupPorts(ctx, createdPortIDs)
 		return "", err
 	}
 
 	return srv.ID, nil
+}
+
+// cleanupPorts deletes a list of pre-created ports, logging any errors.
+func (g *InstanceGroup) cleanupPorts(ctx context.Context, portIDs []string) {
+	for _, portID := range portIDs {
+		if err := g.client.DeletePort(ctx, portID); err != nil {
+			g.log.Error("Failed to clean up port", "port_id", portID, "err", err)
+		}
+	}
 }
 
 func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (provider.ConnectInfo, error) {

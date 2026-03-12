@@ -14,6 +14,17 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
 )
 
+// PluginNetwork extends servers.Network with subnet selection support.
+// When SubnetID is set, the plugin pre-creates a Neutron port on the
+// specified subnet and passes the port ID to Nova instead of the network UUID.
+type PluginNetwork struct {
+	UUID     string `json:"uuid,omitempty"`
+	Port     string `json:"port,omitempty"`
+	FixedIP  string `json:"fixed_ip,omitempty"`
+	Tag      string `json:"tag,omitempty"`
+	SubnetID string `json:"subnet_id,omitempty"`
+}
+
 // ExtCreateOpts extended version of servers.CreateOpts
 // nolint:revive
 type ExtCreateOpts struct {
@@ -27,7 +38,7 @@ type ExtCreateOpts struct {
 	ImageName string `json:"image_name,omitempty"`
 
 	// annotation overrides
-	Networks       []servers.Network          `json:"networks,omitempty"`
+	Networks       []PluginNetwork            `json:"networks,omitempty"`
 	SecurityGroups []string                   `json:"security_groups,omitempty"`
 	UserData       string                     `json:"user_data,omitempty"`
 	SchedulerHints *servers.SchedulerHintOpts `json:"scheduler_hints,omitempty"`
@@ -36,7 +47,16 @@ type ExtCreateOpts struct {
 // ToServerCreateMap for extended opts
 func (opts ExtCreateOpts) ToServerCreateMap() (map[string]interface{}, error) {
 	if opts.Networks != nil {
-		opts.CreateOpts.Networks = opts.Networks
+		networks := make([]servers.Network, len(opts.Networks))
+		for i, net := range opts.Networks {
+			networks[i] = servers.Network{
+				UUID:    net.UUID,
+				Port:    net.Port,
+				FixedIP: net.FixedIP,
+				Tag:     net.Tag,
+			}
+		}
+		opts.CreateOpts.Networks = networks
 	}
 
 	if opts.SecurityGroups != nil {

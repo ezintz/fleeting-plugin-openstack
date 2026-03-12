@@ -108,6 +108,81 @@ func TestExtCreateOpts(t *testing.T) {
 	//t.Log(string(req))
 }
 
+func TestExtCreateOptsWithSubnetID(t *testing.T) {
+	assert := assert.New(t)
+
+	cfgJSON := `
+	{
+		"name": "gitlab-runner-%d",
+		"flavorRef": "5",
+		"imageRef": "f2403879-6fbe-49a0-b71f-54b70039f32a",
+		"networks": [
+			{"uuid": "c487d046-80ad-4da0-8b98-4a48ad3c257a", "subnet_id": "a1b2c3d4-0000-1111-2222-333344445555"}
+		]
+	}
+	`
+
+	cfg := new(ExtCreateOpts)
+	err := json.Unmarshal([]byte(cfgJSON), cfg)
+	assert.NoError(err)
+
+	// Verify subnet_id is parsed into the PluginNetwork struct
+	assert.Len(cfg.Networks, 1)
+	assert.Equal("c487d046-80ad-4da0-8b98-4a48ad3c257a", cfg.Networks[0].UUID)
+	assert.Equal("a1b2c3d4-0000-1111-2222-333344445555", cfg.Networks[0].SubnetID)
+
+	// Simulate what the provider does: replace the network with a pre-created port
+	cfg.Networks[0] = PluginNetwork{Port: "pre-created-port-id"}
+
+	omap, err := cfg.ToServerCreateMap()
+	assert.NoError(err)
+	assert.NotNil(omap)
+
+	req, err := json.Marshal(omap)
+	assert.NoError(err)
+
+	expected := `{"server":{"flavorRef":"5","imageRef":"f2403879-6fbe-49a0-b71f-54b70039f32a","name":"gitlab-runner-%d","networks":[{"port":"pre-created-port-id"}]}}`
+	assert.Equal(expected, string(req))
+}
+
+func TestPluginNetworkJSON(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    string
+		expected PluginNetwork
+	}{
+		{
+			"uuid only",
+			`{"uuid": "net-id"}`,
+			PluginNetwork{UUID: "net-id"},
+		},
+		{
+			"uuid with subnet_id",
+			`{"uuid": "net-id", "subnet_id": "sub-id"}`,
+			PluginNetwork{UUID: "net-id", SubnetID: "sub-id"},
+		},
+		{
+			"port only",
+			`{"port": "port-id"}`,
+			PluginNetwork{Port: "port-id"},
+		},
+		{
+			"uuid with fixed_ip",
+			`{"uuid": "net-id", "fixed_ip": "10.0.0.5"}`,
+			PluginNetwork{UUID: "net-id", FixedIP: "10.0.0.5"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var net PluginNetwork
+			err := json.Unmarshal([]byte(tc.input), &net)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expected, net)
+		})
+	}
+}
+
 func TestInsertSSHKeyIgn(t *testing.T) {
 	testCases := []struct {
 		name     string

@@ -23,6 +23,25 @@ The following parameters are supported:
 | `server_spec`         | object | Server spec used to create instances. See: [Compute API](https://docs.openstack.org/api-ref/compute/#create-server) |
 
 
+### Subnet support
+
+The `networks` array in `server_spec` accepts an optional `subnet_id` field.
+When specified, the plugin pre-creates a Neutron port on the given subnet and
+passes the port ID to Nova. This is useful when a network has multiple subnets
+and you need instances placed on a specific one.
+
+```toml
+# Network only (Nova picks the subnet)
+networks = [ { uuid = "network-uuid" } ]
+
+# Network + specific subnet
+networks = [ { uuid = "network-uuid", subnet_id = "subnet-uuid" } ]
+```
+
+Pre-created ports are tagged with `fleeting-plugin-openstack` as their
+description and are automatically cleaned up when instances are deleted.
+
+
 ### Default connector config
 
 | Parameter                | Default  |
@@ -133,7 +152,7 @@ imageRef = "d5460af5-83f3-47d7-9c4f-80294c66b267"                       # Flatca
 image_name = "flatcar"                                                  # Resolve imageRef. If set, each time a new VM should be created, the imageRef will be resolved.
 flavorRef = "4e9d4fa4-a703-4850-8bc1-58b5e139ab57"                      # xlarge flavor
 # key_name = "ci-admin"                                                 # SSH public key for worker nodes
-networks = [ { uuid = "f05e7f64-9e0f-4c5c-acb0-b636000d7301" } ]        # tenant network
+networks = [ { uuid = "f05e7f64-9e0f-4c5c-acb0-b636000d7301", subnet_id = "a1b2c3d4-0000-1111-2222-e05e7f649e0f" } ]  # tenant network + subnet
 security_groups = [ "cee22d91-bb9a-455d-be88-e911d3cb066a" ]            # allow SSH ingress from tenant network
 scheduler_hints = { group = "a9c941cb-5b34-46e0-8fc6-7471e3b77c75" }    # [Soft-]Anti-Affinity group
 # May be used to pass #cloud-config or ignition scripts.

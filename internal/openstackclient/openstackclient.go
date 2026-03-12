@@ -14,6 +14,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/config"
 	"github.com/gophercloud/gophercloud/v2/openstack/config/clouds"
 	"github.com/gophercloud/gophercloud/v2/openstack/image/v2/images"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/ports"
 	"github.com/gophercloud/gophercloud/v2/openstack/utils"
 	osClient "github.com/gophercloud/utils/v2/client"
 )
@@ -81,11 +82,15 @@ type Client interface {
 	ListServers(ctx context.Context) ([]servers.Server, error)
 	CreateServer(ctx context.Context, spec servers.CreateOptsBuilder, hintOpts servers.SchedulerHintOptsBuilder) (*servers.Server, error)
 	DeleteServer(ctx context.Context, serverId string) error
+	CreatePort(ctx context.Context, networkID, subnetID, description string) (*ports.Port, error)
+	DeletePort(ctx context.Context, portID string) error
+	ListPortsByDeviceID(ctx context.Context, deviceID string) ([]ports.Port, error)
 }
 
 type client struct {
 	compute *gophercloud.ServiceClient
 	image   *gophercloud.ServiceClient
+	network *gophercloud.ServiceClient
 }
 
 func New(ctx context.Context, authConfig AuthConfig, cloudOpts *CloudOpts) (Client, error) {
@@ -119,9 +124,15 @@ func New(ctx context.Context, authConfig AuthConfig, cloudOpts *CloudOpts) (Clie
 		return nil, err
 	}
 
+	networkClient, err := openstack.NewNetworkV2(providerClient, endpointOps)
+	if err != nil {
+		return nil, err
+	}
+
 	return &client{
 		compute: computeClient,
 		image:   imageClient,
+		network: networkClient,
 	}, nil
 }
 
@@ -314,4 +325,33 @@ func (c *client) CreateServer(ctx context.Context, spec servers.CreateOptsBuilde
 
 func (c *client) DeleteServer(ctx context.Context, serverId string) error {
 	return servers.Delete(ctx, c.compute, serverId).ExtractErr()
+}
+
+func (c *client) CreatePort(ctx context.Context, networkID, subnetID, description string) (*ports.Port, error) {
+	opts := ports.CreateOpts{
+		NetworkID:   networkID,
+		Description: description,
+		FixedIPs: []ports.IP{
+			{SubnetID: subnetID},
+		},
+	}
+	return ports.Create(ctx, c.network, opts).Extract()
+}
+
+func (c *client) DeletePort(ctx context.Context, portID string) error {
+	return ports.Delete(ctx, c.network, portID).ExtractErr()
+}
+
+func (c *client) ListPortsByDeviceID(ctx context.Context, deviceID string) ([]ports.Port, error) {
+	page, err := ports.List(c.network, ports.ListOpts{DeviceID: deviceID}).AllPages(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("port listing error: %w", err)
+	}
+
+	allPorts, err := ports.ExtractPorts(page)
+	if err != nil {
+		return nil, fmt.Errorf("port listing extract error: %w", err)
+	}
+
+	return allPorts, nil
 }

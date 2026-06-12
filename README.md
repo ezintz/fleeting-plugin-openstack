@@ -247,3 +247,42 @@ idle_time = "30m0s"
 scale_factor = 0.0
 scale_factor_limit = 0
 ```
+
+
+Verifying releases
+------------------
+
+Every release is built by the [SLSA3 Go builder][slsa-go] (signed in-toto
+provenance attached to each binary) and the resulting multi-arch OCI image
+is signed with [cosign][cosign] keyless via the GitHub OIDC token. Both
+signatures are recorded in the public [Rekor][rekor] transparency log.
+
+### Verify the binary
+
+```bash
+# Download the binary and its provenance from the release
+gh release download v0.34.0 --repo ezintz/fleeting-plugin-openstack \
+  --pattern 'fleeting-plugin-openstack-linux-amd64*'
+
+slsa-verifier verify-artifact \
+  --provenance-path fleeting-plugin-openstack-linux-amd64.intoto.jsonl \
+  --source-uri github.com/ezintz/fleeting-plugin-openstack \
+  --source-tag v0.34.0 \
+  fleeting-plugin-openstack-linux-amd64
+```
+
+### Verify the OCI image
+
+```bash
+cosign verify \
+  --certificate-identity-regexp 'https://github.com/ezintz/fleeting-plugin-openstack/.github/workflows/release.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/ezintz/fleeting-plugin-openstack:0.34.0
+```
+
+Pin to an immutable digest in production (`...@sha256:...`) instead of a
+mutable tag.
+
+[slsa-go]: https://github.com/slsa-framework/slsa-github-generator/blob/main/internal/builders/go/README.md
+[cosign]: https://docs.sigstore.dev/cosign/
+[rekor]: https://docs.sigstore.dev/rekor/overview/

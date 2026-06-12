@@ -104,7 +104,7 @@ jobs:
         run: |
           crane mutate "ghcr.io/${REPO}:${VERSION}" \
             --annotation "org.opencontainers.image.title=fleeting-plugin-openstack" \
-            --annotation "org.opencontainers.image.description=GitLab fleeting plugin for OpenStack — fork of sardinasystems with hda picks plus subnet_id support" \
+            --annotation "org.opencontainers.image.description=GitLab fleeting plugin for OpenStack" \
             --annotation "org.opencontainers.image.source=https://github.com/${REPO}" \
             --annotation "org.opencontainers.image.url=https://github.com/${REPO}" \
             --annotation "org.opencontainers.image.documentation=https://github.com/${REPO}/blob/main/README.md" \

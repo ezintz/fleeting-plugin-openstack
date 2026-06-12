@@ -6,6 +6,10 @@ on:
     tags:
       - '*'
 
+permissions:
+  contents: write   # goreleaser creates the GitHub release
+  packages: write   # docker login + fleeting-artifact push to GHCR
+
 jobs:
   goreleaser:
     runs-on: ubuntu-latest

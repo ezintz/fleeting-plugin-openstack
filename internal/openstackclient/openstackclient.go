@@ -307,7 +307,7 @@ func (c *client) GetImageByMetadata(ctx context.Context, imageRefMetadataKey str
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to query metadata service: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 
 	var metadata struct {
 		Meta map[string]string `json:"meta,omitempty"`

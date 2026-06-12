@@ -302,7 +302,7 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 		if username == "" {
 			imgProps := g.imgProps.Load()
 			if imgProps.OSAdminUser == "" {
-				return "", fmt.Errorf("image properties 'os_admin_user' and 'runners.autoscaler.connector_config.username' missing. Ensure one is set.")
+				return "", fmt.Errorf("image properties 'os_admin_user' and 'runners.autoscaler.connector_config.username' missing; ensure one is set")
 			}
 			username = imgProps.OSAdminUser
 		}

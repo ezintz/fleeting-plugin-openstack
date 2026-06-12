@@ -33,6 +33,7 @@ type fakeClient struct {
 
 type createPortCall struct {
 	NetworkID, SubnetID, Description string
+	SecurityGroups                   []string
 }
 
 type createServerCall struct {
@@ -41,9 +42,9 @@ type createServerCall struct {
 
 func newFakeClient() *fakeClient { return &fakeClient{} }
 
-func (f *fakeClient) CreatePort(_ context.Context, networkID, subnetID, description string) (*ports.Port, error) {
+func (f *fakeClient) CreatePort(_ context.Context, networkID, subnetID, description string, securityGroups []string) (*ports.Port, error) {
 	id := fmt.Sprintf("port-%d", f.nextPortID.Add(1))
-	f.createPortCalls = append(f.createPortCalls, createPortCall{networkID, subnetID, description})
+	f.createPortCalls = append(f.createPortCalls, createPortCall{networkID, subnetID, description, securityGroups})
 	return &ports.Port{ID: id, NetworkID: networkID, Description: description}, nil
 }
 
@@ -194,6 +195,35 @@ func TestCreateInstance_MixedNetworksOnlyPreCreatesForSubnetEntries(t *testing.T
 	require.Len(t, fc.createPortCalls, 2)
 	assert.Equal(t, "subnet-b", fc.createPortCalls[0].SubnetID)
 	assert.Equal(t, "subnet-c", fc.createPortCalls[1].SubnetID)
+}
+
+func TestCreateInstance_SubnetIDPortInheritsSecurityGroups(t *testing.T) {
+	fc := newFakeClient()
+	g := newTestGroup(fc, []PluginNetwork{
+		{UUID: "n", SubnetID: "s"},
+	})
+	g.ServerSpec.SecurityGroups = []string{"sg-uuid-1", "sg-uuid-2"}
+
+	_, err := g.createInstance(context.Background())
+	assert.NoError(t, err)
+	require.Len(t, fc.createPortCalls, 1)
+	assert.Equal(t, []string{"sg-uuid-1", "sg-uuid-2"}, fc.createPortCalls[0].SecurityGroups,
+		"pre-created port must inherit server_spec.security_groups, otherwise the worker boots with only the tenant default group")
+}
+
+func TestCreateInstance_SubnetIDPortNoSecurityGroupsWhenUnset(t *testing.T) {
+	fc := newFakeClient()
+	g := newTestGroup(fc, []PluginNetwork{
+		{UUID: "n", SubnetID: "s"},
+	})
+	// g.ServerSpec.SecurityGroups intentionally left nil — Neutron will
+	// fall back to the tenant default and we should not over-specify.
+
+	_, err := g.createInstance(context.Background())
+	assert.NoError(t, err)
+	require.Len(t, fc.createPortCalls, 1)
+	assert.Nil(t, fc.createPortCalls[0].SecurityGroups,
+		"when no security_groups are configured the plugin must not pass an empty list (which would mean 'attach no SGs at all')")
 }
 
 func TestCreateInstance_CleanupPortsOnServerFailure(t *testing.T) {

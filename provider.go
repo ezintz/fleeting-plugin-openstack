@@ -327,7 +327,7 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 	copy(networks, spec.Networks)
 	for i, net := range networks {
 		if net.SubnetID != "" {
-			port, err := g.client.CreatePort(ctx, net.UUID, net.SubnetID, PortDescription)
+			port, err := g.client.CreatePort(ctx, net.UUID, net.SubnetID, PortDescription, spec.SecurityGroups)
 			if err != nil {
 				g.cleanupPorts(ctx, createdPortIDs)
 				return "", fmt.Errorf("failed to create port for subnet %s: %w", net.SubnetID, err)

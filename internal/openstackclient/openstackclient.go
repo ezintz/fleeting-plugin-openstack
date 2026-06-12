@@ -88,7 +88,7 @@ type Client interface {
 	ListServers(ctx context.Context) ([]servers.Server, error)
 	CreateServer(ctx context.Context, spec servers.CreateOptsBuilder, hintOpts servers.SchedulerHintOptsBuilder) (*servers.Server, error)
 	DeleteServer(ctx context.Context, serverId string) error
-	CreatePort(ctx context.Context, networkID, subnetID, description string) (*ports.Port, error)
+	CreatePort(ctx context.Context, networkID, subnetID, description string, securityGroups []string) (*ports.Port, error)
 	DeletePort(ctx context.Context, portID string) error
 	ListPortsByDeviceID(ctx context.Context, deviceID string) ([]ports.Port, error)
 }
@@ -394,13 +394,23 @@ func (c *client) DeleteServer(ctx context.Context, serverId string) error {
 	return servers.Delete(ctx, c.compute, serverId).ExtractErr()
 }
 
-func (c *client) CreatePort(ctx context.Context, networkID, subnetID, description string) (*ports.Port, error) {
+func (c *client) CreatePort(ctx context.Context, networkID, subnetID, description string, securityGroups []string) (*ports.Port, error) {
 	opts := ports.CreateOpts{
 		NetworkID:   networkID,
 		Description: description,
 		FixedIPs: []ports.IP{
 			{SubnetID: subnetID},
 		},
+	}
+	// Nova only applies server_spec.security_groups to ports it creates
+	// itself. When the plugin pre-creates a port (subnet_id flow), the
+	// security groups must be attached at port-creation time, otherwise
+	// the worker boots with just the tenant default and the configured
+	// groups are silently ignored.
+	if len(securityGroups) > 0 {
+		sg := make([]string, len(securityGroups))
+		copy(sg, securityGroups)
+		opts.SecurityGroups = &sg
 	}
 	return ports.Create(ctx, c.network, opts).Extract()
 }

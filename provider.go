@@ -271,18 +271,6 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 		}
 	}
 
-	if g.VolumeSize != 0 && g.VolumeType != "" {
-		spec.BlockDevice = append(spec.BlockDevice, servers.BlockDevice{
-			BootIndex:           0,
-			DeleteOnTermination: true,
-			DestinationType:     servers.DestinationVolume,
-			SourceType:          servers.SourceImage,
-			UUID:                spec.ImageRef,
-			VolumeSize:          g.VolumeSize,
-			VolumeType:          g.VolumeType,
-		})
-	}
-
 	if spec.ImageName != "" {
 		imageRef, imgProps, err := g.client.GetImageByName(ctx, spec.ImageName)
 		if err != nil {
@@ -312,6 +300,18 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 
 			spec.Networks[i] = PluginNetwork{Port: port.ID, Tag: net.Tag}
 		}
+	}
+
+	if g.VolumeSize != 0 && g.VolumeType != "" {
+		spec.BlockDevice = append(spec.BlockDevice, servers.BlockDevice{
+			BootIndex:           0,
+			DeleteOnTermination: true,
+			DestinationType:     servers.DestinationVolume,
+			SourceType:          servers.SourceImage,
+			UUID:                spec.ImageRef,
+			VolumeSize:          g.VolumeSize,
+			VolumeType:          g.VolumeType,
+		})
 	}
 
 	srv, err := g.client.CreateServer(ctx, spec, hintOpts)

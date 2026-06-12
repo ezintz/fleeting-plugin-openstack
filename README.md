@@ -183,7 +183,7 @@ max_instances = 16
 # NOTE: If you manually download plugin and place it into your PATH:
 # plugin = "fleeting-plugin-openstack"
 # Or just run `gitlab-runner fleeting install` and it'll download OCI image automatically.
-plugin = "ghcr.io/ezintz/fleeting-plugin-openstack:0.33.0-ezintz.0"
+plugin = "ghcr.io/ezintz/fleeting-plugin-openstack:0.34.0"
 
 [runners.autoscaler.plugin_config]
 cloud = "runner"

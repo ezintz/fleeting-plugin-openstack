@@ -316,8 +316,16 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 	// Pre-create Neutron ports for networks that specify a SubnetID.
 	// Nova does not support subnet_id directly, so we create a port on the
 	// desired subnet and pass the port ID to Nova instead.
+	//
+	// Build a fresh networks slice rather than mutating spec.Networks in
+	// place: copier.Copy gives a shallow copy, so spec.Networks shares
+	// backing storage with g.ServerSpec.Networks. Mutating it would leak
+	// per-instance port IDs into the source spec and the next
+	// createInstance call would resubmit the stale port.
 	var createdPortIDs []string
-	for i, net := range spec.Networks {
+	networks := make([]PluginNetwork, len(spec.Networks))
+	copy(networks, spec.Networks)
+	for i, net := range networks {
 		if net.SubnetID != "" {
 			port, err := g.client.CreatePort(ctx, net.UUID, net.SubnetID, PortDescription)
 			if err != nil {
@@ -328,9 +336,10 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 			createdPortIDs = append(createdPortIDs, port.ID)
 			g.log.Debug("Pre-created port for subnet", "port_id", port.ID, "network_id", net.UUID, "subnet_id", net.SubnetID)
 
-			spec.Networks[i] = PluginNetwork{Port: port.ID, Tag: net.Tag}
+			networks[i] = PluginNetwork{Port: port.ID, Tag: net.Tag}
 		}
 	}
+	spec.Networks = networks
 
 	if g.VolumeSize != 0 && g.VolumeType != "" {
 		spec.BlockDevice = append(spec.BlockDevice, servers.BlockDevice{

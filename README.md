@@ -85,6 +85,13 @@ networks = [ { uuid = "network-uuid", subnet_id = "subnet-uuid" } ]
 Pre-created ports are tagged with `fleeting-plugin-openstack` as their
 description and are automatically cleaned up when instances are deleted.
 
+The plugin also forwards `server_spec.security_groups` to the
+pre-created port — without that, Nova would only attach the tenant
+default group (Nova does not retroactively apply server-level
+security groups to ports it did not create). Note that the Neutron
+port API requires security group **UUIDs**, not names, so when
+`subnet_id` is set every entry in `security_groups` must be a UUID.
+
 
 ### Default connector config
 

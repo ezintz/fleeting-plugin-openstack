@@ -6,6 +6,25 @@ GitLab fleeting plugin for OpenStack.
 https://docs.gitlab.com/runner/executors/docker_autoscaler.html
 
 
+Credits
+-------
+
+This plugin builds on the work of two upstream projects — huge thanks to
+both teams:
+
+- [sardinasystems/fleeting-plugin-openstack][sardinas] — the original plugin
+  this fork is based on.
+- [hdacloud/fleeting-plugin-openstack][hda] (Jakob Probst and the HDA
+  team) — source of the boot-volume, flavor-by-name, image-by-metadata,
+  and SSH `os_admin_user` fallback features cherry-picked into this fork.
+
+This fork's own contribution on top is `subnet_id` support in the
+`networks` array — see [Subnet support](#subnet-support).
+
+[sardinas]: https://github.com/sardinasystems/fleeting-plugin-openstack
+[hda]: https://code.fbi.h-da.de/hdacloud/fleeting-plugin-openstack
+
+
 Plugin Configuration
 --------------------
 
@@ -23,6 +42,29 @@ The following parameters are supported:
 | `server_spec`         | object | Server spec used to create instances. See: [Compute API](https://docs.openstack.org/api-ref/compute/#create-server) |
 | `volume_type`         | string | Optional. Volume type name, must be used in conjunction with `volume_size` |
 | `volume_size`         | int    | Optional. Size of disk volume in gigabytes, must be used in conjunction with `volume_type` |
+
+`volume_size` and `volume_type` are mutually exclusive with defining your own
+root volume via `server_spec.block_device_mapping_v2`: if a block device with
+`boot_index = 0` is already declared there, the plugin refuses to start.
+
+
+### Server spec extensions
+
+The `server_spec` block accepts everything the [Compute API][nova] supports,
+plus the following plugin-specific fields. Each `*_name` / `*_from_metadata`
+field is resolved against OpenStack on every VM creation, so renames or new
+image uploads are picked up automatically.
+
+| Field                     | Type   | Description |
+|---------------------------|--------|-------------|
+| `image_name`              | string | Resolve `imageRef` by image name on each VM creation |
+| `image_ref_from_metadata` | string | Resolve `imageRef` by matching an image metadata key |
+| `flavor_name`             | string | Resolve `flavorRef` by flavor name on each VM creation |
+
+See also [Subnet support](#subnet-support) for the `networks[].subnet_id`
+field.
+
+[nova]: https://docs.openstack.org/api-ref/compute/#create-server
 
 
 ### Subnet support
@@ -52,6 +94,11 @@ description and are automatically cleaned up when instances are deleted.
 | `protocol`               | `ssh`    |
 | `username`               | `unset`  |
 | `use_static_credentials` | `false`  |
+
+When `use_ignition = true` and `username` is left unset, the plugin falls
+back to the image's `os_admin_user` metadata property. If neither is set,
+instance creation fails with a clear error rather than silently using the
+wrong user.
 
 
 OpenStack setup
@@ -136,7 +183,7 @@ max_instances = 16
 # NOTE: If you manually download plugin and place it into your PATH:
 # plugin = "fleeting-plugin-openstack"
 # Or just run `gitlab-runner fleeting install` and it'll download OCI image automatically.
-plugin = "ghcr.io/sardinasystems/fleeting-plugin-openstack:latest"
+plugin = "ghcr.io/ezintz/fleeting-plugin-openstack:0.33.0-ezintz.0"
 
 [runners.autoscaler.plugin_config]
 cloud = "runner"
@@ -145,14 +192,18 @@ name = "scaling-runner-stack-id"
 nova_microversion = "2.79" # train+
 boot_time = "10m"
 use_ignition = true  # enable injection of dynamic SSH key into Ignition config
+# volume_type = "ssd"  # optional: boot from a fresh volume of this type...
+# volume_size = 40     # ...and this size (GB). Both required together.
 
 [runners.autoscaler.plugin_config.server_spec]
 name = "scaling-runner-%d"                                               # %d replaced with instance index
 description = "GitLab CI Docker runners with autoscaling"
 tags = ["GitLab", "CI", "Docker", "Scaling"]
 imageRef = "d5460af5-83f3-47d7-9c4f-80294c66b267"                       # Flatcar Linux (ID)
-image_name = "flatcar"                                                  # Resolve imageRef. If set, each time a new VM should be created, the imageRef will be resolved.
+image_name = "flatcar"                                                  # Resolve imageRef by name on each VM creation.
+# image_ref_from_metadata = "runner-image"                              # Alternative: resolve imageRef via image metadata key.
 flavorRef = "4e9d4fa4-a703-4850-8bc1-58b5e139ab57"                      # xlarge flavor
+# flavor_name = "xlarge"                                                # Alternative: resolve flavorRef by name on each VM creation.
 # key_name = "ci-admin"                                                 # SSH public key for worker nodes
 networks = [ { uuid = "f05e7f64-9e0f-4c5c-acb0-b636000d7301", subnet_id = "a1b2c3d4-0000-1111-2222-e05e7f649e0f" } ]  # tenant network + subnet
 security_groups = [ "cee22d91-bb9a-455d-be88-e911d3cb066a" ]            # allow SSH ingress from tenant network

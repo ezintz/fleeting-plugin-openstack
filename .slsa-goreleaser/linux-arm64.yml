@@ -16,6 +16,6 @@ binary: fleeting-plugin-openstack-{{ .Os }}-{{ .Arch }}
 ldflags:
   - -s
   - -w
-  - -X github.com/sardinasystems/fleeting-plugin-openstack.Version={{ .Env.VERSION }}
-  - -X github.com/sardinasystems/fleeting-plugin-openstack.Revision={{ .Env.COMMIT }}
-  - -X github.com/sardinasystems/fleeting-plugin-openstack.BuildUser=slsa-github-generator
+  - -X github.com/ezintz/fleeting-plugin-openstack.Version={{ .Env.VERSION }}
+  - -X github.com/ezintz/fleeting-plugin-openstack.Revision={{ .Env.COMMIT }}
+  - -X github.com/ezintz/fleeting-plugin-openstack.BuildUser=slsa-github-generator

@@ -12,7 +12,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
 	"github.com/hashicorp/go-hclog"
 	"github.com/jinzhu/copier"
-	"github.com/sardinasystems/fleeting-plugin-openstack/internal/openstackclient"
+	"github.com/ezintz/fleeting-plugin-openstack/internal/openstackclient"
 
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
 )

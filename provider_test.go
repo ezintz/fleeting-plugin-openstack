@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/sardinasystems/fleeting-plugin-openstack/internal/openstackclient"
+	"github.com/ezintz/fleeting-plugin-openstack/internal/openstackclient"
 )
 
 // fakeClient is a hand-rolled mock of openstackclient.Client for unit

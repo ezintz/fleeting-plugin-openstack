@@ -19,5 +19,5 @@
 
 # Go workspace file
 go.work
-fleeting-plugin-openstack
+/fleeting-plugin-openstack
 dist/

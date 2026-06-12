@@ -2,9 +2,8 @@
 name: goreleaser
 
 on:
-  push:
-    tags:
-      - '*'
+  release:
+    types: [published]
 
 permissions:
   contents: write   # goreleaser creates the GitHub release

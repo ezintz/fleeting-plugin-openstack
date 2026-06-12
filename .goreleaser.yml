@@ -31,3 +31,12 @@ archives:
     files:
       - LICENSE
       - README.md
+
+release:
+  # Workflow triggers on `release: published`, so the GitHub release already
+  # exists by the time goreleaser runs. Keep the user-authored notes intact
+  # and let goreleaser only upload the binaries + checksums.
+  mode: keep-existing
+  # Make re-runs safe — if an asset upload fails with 422 (already exists),
+  # delete the existing asset and retry instead of erroring out.
+  replace_existing_artifacts: true

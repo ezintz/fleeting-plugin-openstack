@@ -1,0 +1,21 @@
+version: 1
+
+env:
+  - GO111MODULE=on
+  - CGO_ENABLED=0
+
+flags:
+  - -trimpath
+
+goos: linux
+goarch: amd64
+
+main: ./cmd/fleeting-plugin-openstack
+binary: fleeting-plugin-openstack-{{ .Os }}-{{ .Arch }}
+
+ldflags:
+  - -s
+  - -w
+  - -X github.com/sardinasystems/fleeting-plugin-openstack.Version={{ .Env.VERSION }}
+  - -X github.com/sardinasystems/fleeting-plugin-openstack.Revision={{ .Env.COMMIT }}
+  - -X github.com/sardinasystems/fleeting-plugin-openstack.BuildUser=slsa-github-generator

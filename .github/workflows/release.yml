@@ -1,38 +1,98 @@
 ---
-name: goreleaser
+name: release
 
 on:
   release:
     types: [published]
 
-permissions:
-  contents: write   # goreleaser creates the GitHub release
-  packages: write   # docker login + fleeting-artifact push to GHCR
+# Default to no permissions; each job opts into what it needs.
+permissions: {}
 
 jobs:
-  goreleaser:
+  # Strip the leading `v` from the release tag once, so downstream jobs
+  # don't each re-implement the same shell snippet.
+  setup:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Unshallow
-        run: git fetch --prune --unshallow
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - id: ver
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  # SLSA3 Go builder: compiles one binary per arch in a hardened runner
+  # and uploads the binary + signed in-toto provenance attestation to the
+  # GitHub release. Consumers verify with `slsa-verifier`.
+  build:
+    needs: setup
+    permissions:
+      id-token: write   # OIDC token for Sigstore keyless signing
+      contents: write   # Upload binary + provenance to the release
+      actions: read     # SLSA introspects the workflow run for provenance
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    uses: slsa-framework/slsa-github-generator/.github/workflows/builder_go_slsa3.yml@v2.1.0
+    with:
+      go-version-file: go.mod
+      config-file: .slsa-goreleaser/linux-${{ matrix.arch }}.yml
+      upload-assets: true
+      upload-tag-name: ${{ github.event.release.tag_name }}
+      evaluated-envs: "VERSION:${{ needs.setup.outputs.version }},COMMIT:${{ github.sha }}"
+
+  # Assemble a multi-arch OCI image from the SLSA-built binaries and sign
+  # it with cosign (keyless via the GitHub OIDC token). The signature is
+  # recorded in the public Rekor transparency log.
+  oci:
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read    # Download release assets
+      packages: write   # Push to GHCR
+      id-token: write   # OIDC token for cosign keyless signing
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          version: latest
-          args: release
+
+      - name: Download SLSA-built binaries from the release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            mkdir -p "dist/linux/${arch}"
+            gh release download "$TAG" --repo "$REPO" \
+              --pattern "fleeting-plugin-openstack-linux-${arch}" \
+              --output "dist/linux/${arch}/plugin"
+            chmod +x "dist/linux/${arch}/plugin"
+          done
+
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Release OCI images
-        run: ./ci/release-oci-images.sh
+
+      - name: Install fleeting-artifact
+        run: go install gitlab.com/gitlab-org/fleeting/fleeting-artifact/...@latest
+
+      - name: Push multi-arch OCI image
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: fleeting-artifact release "ghcr.io/${REPO}:${VERSION}"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign image and per-arch manifests (keyless via OIDC)
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: cosign sign --yes --recursive "ghcr.io/${REPO}:${VERSION}"

@@ -80,10 +80,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install fleeting-artifact and crane
-        run: |
-          go install gitlab.com/gitlab-org/fleeting/fleeting-artifact/...@latest
-          go install github.com/google/go-containerregistry/cmd/crane@latest
+      - name: Install fleeting-artifact
+        run: go install gitlab.com/gitlab-org/fleeting/fleeting-artifact/...@latest
 
       - name: Push multi-arch OCI image
         env:
@@ -92,25 +90,34 @@ jobs:
         run: fleeting-artifact release "ghcr.io/${REPO}:${VERSION}"
 
       # Add OCI annotations to the manifest index so GHCR (and other
-      # registries) show a description, source link, license, etc. This
-      # mutation produces a new image digest, so it MUST happen before
-      # cosign signs the image — otherwise the tag would end up pointing
-      # at an unsigned manifest.
-      - name: Annotate OCI image manifest
+      # registries) show a description, source link, license, etc.
+      #
+      # crane mutate does not yet support annotating an OCI image index
+      # (multi-arch manifest), so use `docker buildx imagetools create`
+      # which is pre-installed on GitHub runners and supports
+      # `--annotation index:...` for index-level annotations.
+      #
+      # This step replaces the tag with a new index (same per-arch
+      # manifests, new index digest), so it MUST run before cosign signs
+      # the image — otherwise the tag would end up pointing at an
+      # unsigned manifest.
+      - name: Annotate OCI image manifest index
         env:
           VERSION: ${{ needs.setup.outputs.version }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
         run: |
-          crane mutate "ghcr.io/${REPO}:${VERSION}" \
-            --annotation "org.opencontainers.image.title=fleeting-plugin-openstack" \
-            --annotation "org.opencontainers.image.description=GitLab fleeting plugin for OpenStack" \
-            --annotation "org.opencontainers.image.source=https://github.com/${REPO}" \
-            --annotation "org.opencontainers.image.url=https://github.com/${REPO}" \
-            --annotation "org.opencontainers.image.documentation=https://github.com/${REPO}/blob/main/README.md" \
-            --annotation "org.opencontainers.image.version=${VERSION}" \
-            --annotation "org.opencontainers.image.revision=${SHA}" \
-            --annotation "org.opencontainers.image.licenses=Apache-2.0"
+          docker buildx imagetools create \
+            -t "ghcr.io/${REPO}:${VERSION}" \
+            --annotation "index:org.opencontainers.image.title=fleeting-plugin-openstack" \
+            --annotation "index:org.opencontainers.image.description=GitLab fleeting plugin for OpenStack" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${REPO}" \
+            --annotation "index:org.opencontainers.image.url=https://github.com/${REPO}" \
+            --annotation "index:org.opencontainers.image.documentation=https://github.com/${REPO}/blob/main/README.md" \
+            --annotation "index:org.opencontainers.image.version=${VERSION}" \
+            --annotation "index:org.opencontainers.image.revision=${SHA}" \
+            --annotation "index:org.opencontainers.image.licenses=Apache-2.0" \
+            "ghcr.io/${REPO}:${VERSION}"
 
       - uses: sigstore/cosign-installer@v3
 

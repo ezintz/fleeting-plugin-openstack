@@ -117,6 +117,17 @@ func newTestGroup(fc *fakeClient, networks []PluginNetwork) *InstanceGroup {
 	}
 }
 
+// serverNameFromCall pulls the "name" the plugin sent to Nova out of the
+// captured create payload.
+func serverNameFromCall(t *testing.T, call createServerCall) string {
+	t.Helper()
+	srv, ok := call.SpecMap["server"].(map[string]interface{})
+	require.True(t, ok, "create payload has no server map")
+	name, ok := srv["name"].(string)
+	require.True(t, ok, "create payload has no server name")
+	return name
+}
+
 // portRefsFromCall extracts the per-network "port" values from the
 // CreateServer payload captured by the test fake. ToServerCreateMap
 // returns a heterogeneous map[string]any (the networks slice keeps its
@@ -350,4 +361,69 @@ func TestCreateInstance_CleanupPortsOnServerFailure(t *testing.T) {
 	assert.Empty(t, id)
 	require.Len(t, fc.createPortCalls, 1, "port should still have been pre-created")
 	assert.Equal(t, []string{"port-1"}, fc.deletePortCalls, "pre-created port must be cleaned up when CreateServer fails")
+}
+
+func TestValidateNameTemplate(t *testing.T) {
+	tests := []struct {
+		name     string
+		template string
+		wantErr  bool
+	}{
+		{"decimal verb", "vm-%d", false},
+		{"zero padded verb", "runner-%03d", false},
+		{"verb in the middle", "ci-%d-worker", false},
+		{"no verb", "runner", true},
+		{"escaped percent only", "runner-100%%", true},
+		{"string verb", "runner-%s", true},
+		{"two verbs", "runner-%d-%d", true},
+		{"unknown verb", "runner-%y", true},
+		{"empty", "", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateNameTemplate(tc.template)
+			if tc.wantErr {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "server_spec.name")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// Without validation, a template lacking an integer verb reaches Nova with
+// fmt's error marker baked into the server name. Pin that so the Init guard
+// cannot regress unnoticed.
+func TestCreateInstance_NameWithoutVerbLeaksFmtMarker(t *testing.T) {
+	fc := newFakeClient()
+	g := newTestGroup(fc, nil)
+	g.ServerSpec.Name = "runner"
+
+	require.Error(t, validateNameTemplate(g.ServerSpec.Name))
+
+	_, err := g.createInstance(t.Context())
+	require.NoError(t, err)
+
+	require.Len(t, fc.createServerCalls, 1)
+	require.Equal(t, "runner%!(EXTRA int=1)", serverNameFromCall(t, fc.createServerCalls[0]))
+}
+
+// A valid template is expanded to a distinct name per instance.
+func TestCreateInstance_NameTemplateExpandsPerInstance(t *testing.T) {
+	fc := newFakeClient()
+	g := newTestGroup(fc, nil)
+	g.ServerSpec.Name = "runner-%d"
+
+	require.NoError(t, validateNameTemplate(g.ServerSpec.Name))
+
+	for range 2 {
+		_, err := g.createInstance(t.Context())
+		require.NoError(t, err)
+	}
+
+	require.Len(t, fc.createServerCalls, 2)
+	require.Equal(t, "runner-1", serverNameFromCall(t, fc.createServerCalls[0]))
+	require.Equal(t, "runner-2", serverNameFromCall(t, fc.createServerCalls[1]))
 }

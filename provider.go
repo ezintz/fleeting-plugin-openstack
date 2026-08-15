@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -76,6 +77,10 @@ func (g *InstanceGroup) Init(ctx context.Context, log hclog.Logger, settings pro
 	_, err = g.ServerSpec.ToServerCreateMap()
 	if err != nil {
 		return provider.ProviderInfo{}, fmt.Errorf("failed to check server_spec: %w", err)
+	}
+
+	if err := validateNameTemplate(g.ServerSpec.Name); err != nil {
+		return provider.ProviderInfo{}, err
 	}
 
 	if g.ServerSpec.ImageRef != "" {
@@ -264,6 +269,27 @@ func (g *InstanceGroup) getInstances(ctx context.Context) ([]servers.Server, err
 	}
 
 	return filteredServers, nil
+}
+
+// validateNameTemplate rejects a server_spec.name that createInstance cannot
+// expand into a unique per-instance name.
+//
+// createInstance runs the name through fmt.Sprintf with the group's instance
+// counter, so it has to carry exactly one integer verb. Misuse is not a hard
+// failure — fmt reports it inline instead, so a template like "runner" turns
+// into the literal server name "runner%!(EXTRA int=1)" and every instance in
+// the group carries that marker for its whole life. Catch it at Init, where
+// the operator still sees the error, rather than at the Nova API.
+func validateNameTemplate(name string) error {
+	// Any misuse of the template — no verb, a non-integer verb, or more than
+	// one — shows up as a %!-prefixed error marker in the expansion.
+	if expanded := fmt.Sprintf(name, 1); strings.Contains(expanded, "%!") {
+		return fmt.Errorf(
+			"server_spec.name %q must contain exactly one integer format verb (for example %q) so each instance gets a unique name, but expanding it produced %q",
+			name, "runner-%d", expanded)
+	}
+
+	return nil
 }
 
 func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {

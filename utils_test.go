@@ -103,9 +103,6 @@ func TestExtCreateOpts(t *testing.T) {
 	req, err := json.Marshal(omap)
 	assert.NoError(err)
 	assert.Equal(expected, string(req))
-
-	//t.Log(omap)
-	//t.Log(string(req))
 }
 
 func TestExtCreateOptsWithSubnetID(t *testing.T) {

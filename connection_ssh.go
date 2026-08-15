@@ -1,3 +1,6 @@
+// Package fpoc implements the GitLab fleeting provider for OpenStack: it
+// creates, tracks and deletes Nova instances so GitLab Runner's
+// docker-autoscaler executor can use them as autoscaled CI workers.
 package fpoc
 
 import (
@@ -15,6 +18,8 @@ import (
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
 )
 
+// PrivPub is a private key that can produce its public half. It exists so the
+// plugin can handle a generated and an operator-supplied key uniformly.
 type PrivPub interface {
 	crypto.PrivateKey
 	Public() crypto.PublicKey
@@ -28,14 +33,15 @@ func (g *InstanceGroup) initSSHKey(_ context.Context, log hclog.Logger, settings
 	if len(settings.Key) == 0 {
 		log.Info("Generating dynamic SSH key...")
 
-		key, err = rsa.GenerateKey(rand.Reader, 4096)
+		rsaKey, err := rsa.GenerateKey(rand.Reader, 4096)
 		if err != nil {
 			return fmt.Errorf("generating private key: %w", err)
 		}
+		key = rsaKey
 		settings.Key = pem.EncodeToMemory(
 			&pem.Block{
 				Type:  "RSA PRIVATE KEY",
-				Bytes: x509.MarshalPKCS1PrivateKey(key.(*rsa.PrivateKey)),
+				Bytes: x509.MarshalPKCS1PrivateKey(rsaKey),
 			},
 		)
 

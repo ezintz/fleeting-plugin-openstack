@@ -86,12 +86,16 @@ func (opts ExtCreateOpts) ToServerCreateMap() (map[string]interface{}, error) {
 		b["key_name"] = opts.KeyName
 	}
 
-	sob := ob["server"].(map[string]any)
+	sob, ok := ob["server"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("unexpected server create map: %q is %T, want map[string]any", "server", ob["server"])
+	}
 	maps.Copy(sob, b)
 
 	return ob, nil
 }
 
+// Address is one entry from a Nova server's addresses map.
 type Address struct {
 	Version int    `json:"version"`
 	Address string `json:"addr"`
@@ -103,7 +107,12 @@ func extractAddresses(srv *servers.Server) (map[string][]Address, error) {
 	ret := make(map[string][]Address, len(srv.Addresses))
 
 	for net, isv := range srv.Addresses {
-		ism := isv.([]interface{})
+		// srv.Addresses is decoded straight from Nova's JSON, so a
+		// malformed or unexpected response must not panic the plugin.
+		ism, ok := isv.([]any)
+		if !ok {
+			return nil, fmt.Errorf("unexpected addresses for network %q: %T, want a list", net, isv)
+		}
 		items := make([]Address, 0, len(ism))
 
 		for _, iv := range ism {
@@ -135,6 +144,8 @@ var (
 	initLoginRe      = regexp.MustCompile(`^\S+\ login:\ .*$`)
 )
 
+// IsCloudInitFinished reports whether a console log shows cloud-init has
+// completed, which is how a cloud-init instance signals it is ready.
 func IsCloudInitFinished(log string) bool {
 	lines := strings.Split(log, "\n")
 
@@ -146,6 +157,10 @@ func IsCloudInitFinished(log string) bool {
 	return false
 }
 
+// IsIgnitionFinished reports whether a console log shows an Ignition-based
+// instance (Flatcar, Fedora CoreOS) has finished booting. Flatcar prints no
+// completion marker, so this looks for the SSH host key banner followed by a
+// login prompt.
 func IsIgnitionFinished(log string) bool {
 	lines := strings.Split(log, "\n")
 
@@ -155,7 +170,6 @@ func IsIgnitionFinished(log string) bool {
 	searchKeys := true
 
 	for _, line := range lines {
-
 		if searchKeys {
 			if initSSHHostKeyRe.MatchString(line) {
 				searchKeys = false
@@ -169,6 +183,9 @@ func IsIgnitionFinished(log string) bool {
 	return false
 }
 
+// InsertSSHKeyIgn authorizes pubKey for username in the spec's Ignition
+// user_data, parsing and extending any config the operator supplied rather
+// than replacing it.
 func InsertSSHKeyIgn(spec *ExtCreateOpts, username, pubKey string) error {
 	var cfg igntyp.Config
 	var err error

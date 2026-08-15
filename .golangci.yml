@@ -1,25 +1,123 @@
 version: "2"
 
+issues:
+  # Default caps hide issues (50 per linter, 3 per identical message), which
+  # makes "0 issues" ambiguous. Report everything.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
 linters:
-  # golangci-lint's default set (errcheck, govet, ineffassign, staticcheck,
-  # unused) plus a few low-noise checks that fit what this plugin does.
-  #
-  # Deliberately not enabled: revive. Its default ruleset is dominated by
-  # `exported` (doc comment required on every exported symbol), which flags
-  # ~47 pre-existing sites. Worth doing as its own pass, not as a side
-  # effect of turning formatting checks on.
+  # Linter set tracks gitlab-runner's own .golangci.yml, since this plugin is
+  # loaded into the runner process and is expected to hold to the same bar.
+  # gocognit/nestif/dogsled/nakedret are dropped only where this repo has no
+  # equivalent surface; everything else is kept deliberately.
+  default: none
   enable:
-    # The plugin talks to OpenStack over HTTP; a leaked response body is a
-    # slow fd leak in a long-running runner process.
     - bodyclose
-    - copyloopvar
+    - errcheck
+    - errname
+    - errorlint
+    - gocritic
+    - goprintffuncname
+    - govet
+    - ineffassign
     - misspell
+    - nakedret
+    - revive
+    - staticcheck
     - unconvert
+    - unparam
+    - unused
+    - usetesting
+    - wastedassign
+    - whitespace
+    # Not in gitlab-runner's list, but relevant here: the plugin makes raw
+    # HTTP calls to the OpenStack metadata service and runs for the lifetime
+    # of the runner, so leaked bodies and copied locks matter.
+    - copyloopvar
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+    errorlint:
+      asserts: false
+      comparison: false
+    gocritic:
+      enabled-checks:
+        - appendCombine
+        - boolExprSimplify
+        - commentedOutCode
+        - dupImport
+        - emptyFallthrough
+        - emptyStringTest
+        - equalFold
+        - evalOrder
+        - hexLiteral
+        - indexAlloc
+        - initClause
+        - methodExprCall
+        - nestingReduce
+        - nilValReturn
+        - ptrToRefParam
+        - rangeExprCopy
+        - regexpPattern
+        - sloppyReassign
+        - stringXbytes
+        - truncateCmp
+        - typeAssertChain
+        - typeUnparen
+        - unnecessaryBlock
+        - weakCond
+        - yodaStyleExpr
+    # revive intentionally has NO `rules:` block. In golangci-lint, setting
+    # revive.rules *replaces* the default rule set rather than amending it,
+    # so gitlab-runner's `rules: [{name: unused-parameter, disabled: true}]`
+    # silently reduces revive to a single disabled rule -- verified locally:
+    # 47 findings with the defaults, 0 with their block. Unused parameters
+    # are handled by naming them _ instead.
+    staticcheck:
+      # revive owns naming, doc comments and comment form (var-naming,
+      # exported, package-comments). Turn off staticcheck's equivalents so
+      # the same defect isn't reported twice under two names.
+      checks:
+        - all
+        - -ST1000 # package comment -> revive package-comments
+        - -ST1003 # initialisms     -> revive var-naming
+        - -ST1020 # comment form    -> revive exported
+        - -ST1021 # comment form    -> revive exported
+        - -ST1022 # comment form    -> revive exported
+    usetesting:
+      context-background: true
+      context-todo: true
+
+  exclusions:
+    generated: lax
+    presets:
+      # NB: gitlab-runner and gophercloud both also enable the "comments"
+      # preset, which suppresses revive's exported/package-comments rules.
+      # Deliberately omitted: this repo is a public Go module that others
+      # import, so exported symbols carry doc comments instead.
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Test helpers legitimately ignore errors and reuse bodies.
+      - linters: [bodyclose, errcheck]
+        path: _test\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
 
 formatters:
-  # `golangci-lint run` only checks the formatters listed here, so with no
-  # config at all gofmt drift (import ordering, comment alignment) reached
-  # main unnoticed. Listing them makes the existing lint job fail on it.
+  # `golangci-lint run` only checks formatters listed here, so with no config
+  # at all gofmt drift reached main unnoticed.
   enable:
     - gofmt
     - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

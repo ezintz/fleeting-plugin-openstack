@@ -1,3 +1,5 @@
+// Command fleeting-plugin-openstack serves the OpenStack fleeting provider
+// over the go-plugin gRPC protocol for GitLab Runner's docker-autoscaler.
 package main
 
 import (

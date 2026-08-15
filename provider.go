@@ -17,11 +17,22 @@ import (
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
 )
 
+// MetadataKey is the Nova server metadata key that marks an instance as
+// belonging to a particular instance group. Its value is InstanceGroup.Name,
+// and it is how the plugin distinguishes its own workers from every other
+// server in the project.
 const MetadataKey = "fleeting-cluster"
+
+// PortDescription is written to the description field of every Neutron port
+// the plugin pre-creates for a networks[].subnet_id entry, so those ports can
+// be identified and cleaned up when the instance is deleted.
 const PortDescription = "fleeting-plugin-openstack"
 
 var _ provider.InstanceGroup = (*InstanceGroup)(nil)
 
+// InstanceGroup is the fleeting provider for OpenStack. Exported fields are
+// unmarshalled from the runner's [runners.autoscaler.plugin_config] block, so
+// their json tags form the plugin's configuration schema.
 type InstanceGroup struct {
 	Cloud            string        `json:"cloud"`             // cloud to use
 	CloudsConfig     string        `json:"clouds_config"`     // optional: path to clouds.yaml
@@ -42,6 +53,9 @@ type InstanceGroup struct {
 	instanceCounter atomic.Int32
 }
 
+// Init connects to OpenStack, validates the configured server spec, and
+// prepares credentials. In Ignition mode it generates the SSH keypair that
+// will be injected into each instance.
 func (g *InstanceGroup) Init(ctx context.Context, log hclog.Logger, settings provider.Settings) (provider.ProviderInfo, error) {
 	g.log = log.With("name", g.Name, "cloud", g.Cloud)
 	g.log.Debug("Initializing fleeting-plugin-openstack")
@@ -51,7 +65,7 @@ func (g *InstanceGroup) Init(ctx context.Context, log hclog.Logger, settings pro
 		CloudConfig: openstackclient.CloudConfig{
 			ClientConfigFile:  g.CloudsConfig,
 			Cloud:             g.Cloud,
-			ComputeApiVersion: g.NovaMicroversion,
+			ComputeAPIVersion: g.NovaMicroversion,
 		},
 	}, nil)
 
@@ -81,8 +95,6 @@ func (g *InstanceGroup) Init(ctx context.Context, log hclog.Logger, settings pro
 		}
 	}
 
-	// log.With("creds", settings, "image", g.imgProps).Info("settings 1")
-
 	if !g.UseIgnition && !settings.UseStaticCredentials {
 		return provider.ProviderInfo{}, fmt.Errorf("only static credentials supported in Cloud-Init mode")
 	}
@@ -93,8 +105,6 @@ func (g *InstanceGroup) Init(ctx context.Context, log hclog.Logger, settings pro
 			return provider.ProviderInfo{}, err
 		}
 	}
-
-	// log.With("creds", settings, "image", g.imgProps).Info("settings2")
 
 	if g.BootTimeS != "" {
 		g.BootTime, err = time.ParseDuration(g.BootTimeS)
@@ -116,8 +126,11 @@ func (g *InstanceGroup) Init(ctx context.Context, log hclog.Logger, settings pro
 	}, nil
 }
 
+// Update reports the current state of every instance in the group. An ACTIVE
+// server is only promoted to StateRunning once boot_time has elapsed or its
+// console output shows cloud-init/Ignition has finished, so the runner does
+// not dispatch jobs to a machine that is not ready.
 func (g *InstanceGroup) Update(ctx context.Context, update func(instance string, state provider.State)) error {
-
 	instances, err := g.getInstances(ctx)
 	if err != nil {
 		return err
@@ -151,13 +164,16 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 					continue
 				}
 
-				if !g.UseIgnition && IsCloudInitFinished(log) {
+				switch {
+				case !g.UseIgnition && IsCloudInitFinished(log):
 					lg.Info("Instance cloud-init finished")
 					state = provider.StateRunning
-				} else if g.UseIgnition && IsIgnitionFinished(log) {
+
+				case g.UseIgnition && IsIgnitionFinished(log):
 					lg.Info("Instance ignition finished")
 					state = provider.StateRunning
-				} else {
+
+				default:
 					lg.Debug("Instance boot time not passed and cloud-init/ignition not finished", "boot_time", g.BootTime)
 				}
 			}
@@ -169,6 +185,9 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 	return reterr
 }
 
+// Increase requests delta additional instances and reports how many creation
+// requests OpenStack accepted. Failures are logged and joined into err, but do
+// not abort the remaining requests.
 func (g *InstanceGroup) Increase(ctx context.Context, delta int) (succeeded int, err error) {
 	for idx := 0; idx < delta; idx++ {
 		id, err2 := g.createInstance(ctx)
@@ -186,6 +205,9 @@ func (g *InstanceGroup) Increase(ctx context.Context, delta int) (succeeded int,
 	return
 }
 
+// Decrease deletes the named instances and returns those whose deletion was
+// accepted. Ports the plugin pre-created for a subnet_id are looked up before
+// the server is deleted and removed afterwards.
 func (g *InstanceGroup) Decrease(ctx context.Context, instances []string) (succeeded []string, err error) {
 	if len(instances) == 0 {
 		return nil, nil
@@ -222,7 +244,7 @@ func (g *InstanceGroup) Decrease(ctx context.Context, instances []string) (succe
 
 	g.log.Info("Decrease", "instances", instances)
 
-	return
+	return succeeded, err
 }
 
 func (g *InstanceGroup) getInstances(ctx context.Context) ([]servers.Server, error) {
@@ -322,18 +344,20 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 	networks := make([]PluginNetwork, len(spec.Networks))
 	copy(networks, spec.Networks)
 	for i, net := range networks {
-		if net.SubnetID != "" {
-			port, err := g.client.CreatePort(ctx, net.UUID, net.SubnetID, PortDescription, spec.SecurityGroups)
-			if err != nil {
-				g.cleanupPorts(ctx, createdPortIDs)
-				return "", fmt.Errorf("failed to create port for subnet %s: %w", net.SubnetID, err)
-			}
-
-			createdPortIDs = append(createdPortIDs, port.ID)
-			g.log.Debug("Pre-created port for subnet", "port_id", port.ID, "network_id", net.UUID, "subnet_id", net.SubnetID)
-
-			networks[i] = PluginNetwork{Port: port.ID, Tag: net.Tag}
+		if net.SubnetID == "" {
+			continue
 		}
+
+		port, err := g.client.CreatePort(ctx, net.UUID, net.SubnetID, PortDescription, spec.SecurityGroups)
+		if err != nil {
+			g.cleanupPorts(ctx, createdPortIDs)
+			return "", fmt.Errorf("failed to create port for subnet %s: %w", net.SubnetID, err)
+		}
+
+		createdPortIDs = append(createdPortIDs, port.ID)
+		g.log.Debug("Pre-created port for subnet", "port_id", port.ID, "network_id", net.UUID, "subnet_id", net.SubnetID)
+
+		networks[i] = PluginNetwork{Port: port.ID, Tag: net.Tag}
 	}
 	spec.Networks = networks
 
@@ -392,13 +416,15 @@ func (g *InstanceGroup) cleanupPorts(ctx context.Context, portIDs []string) {
 	}
 }
 
+// ConnectInfo returns the address, account and credentials the runner needs to
+// open a connection to an instance. OS and architecture are taken from the
+// image properties captured when the image was resolved.
 func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (provider.ConnectInfo, error) {
 	srv, err := g.client.GetServer(ctx, instanceID)
 	if err != nil {
 		return provider.ConnectInfo{}, fmt.Errorf("failed to get server %s: %w", instanceID, err)
 	}
 
-	// g.log.Debug("Server info", "srv", srv)
 	if srv.Status != "ACTIVE" {
 		return provider.ConnectInfo{}, fmt.Errorf("instance status is not active: %s", srv.Status)
 	}
@@ -477,7 +503,6 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (pro
 		default:
 			g.log.Warn("Unknown image arch", "arch", imgProps.Architecture)
 		}
-
 	} else {
 		// default to linux on amd64
 		info.OS = "linux"
@@ -487,6 +512,8 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (pro
 	return info, nil
 }
 
-func (g *InstanceGroup) Shutdown(ctx context.Context) error {
+// Shutdown is a no-op: instances outlive the plugin process and are reclaimed
+// by the runner through Decrease, not at shutdown.
+func (g *InstanceGroup) Shutdown(_ context.Context) error {
 	return nil
 }

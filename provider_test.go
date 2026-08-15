@@ -153,13 +153,13 @@ func TestCreateInstance_SubnetIDFreshPortPerCall(t *testing.T) {
 		{UUID: "network-uuid", SubnetID: "subnet-uuid"},
 	})
 
-	id1, err := g.createInstance(context.Background())
+	id1, err := g.createInstance(t.Context())
 	assert.NoError(err)
 	assert.Equal("server-1", id1)
 	require.Len(t, fc.createPortCalls, 1, "first call should pre-create one port")
 	assert.Equal("subnet-uuid", fc.createPortCalls[0].SubnetID)
 
-	id2, err := g.createInstance(context.Background())
+	id2, err := g.createInstance(t.Context())
 	assert.NoError(err)
 	assert.Equal("server-2", id2)
 	require.Len(t, fc.createPortCalls, 2, "second call should also pre-create a fresh port — if this is 1, the source spec was mutated and SubnetID got dropped")
@@ -184,7 +184,7 @@ func TestCreateInstance_NoSubnetIDSkipsPortPreCreation(t *testing.T) {
 		{UUID: "network-uuid"},
 	})
 
-	id, err := g.createInstance(context.Background())
+	id, err := g.createInstance(t.Context())
 	assert.NoError(t, err)
 	assert.Equal(t, "server-1", id)
 	assert.Empty(t, fc.createPortCalls, "no SubnetID -> no port pre-creation")
@@ -199,7 +199,7 @@ func TestCreateInstance_MixedNetworksOnlyPreCreatesForSubnetEntries(t *testing.T
 		{UUID: "net-c", SubnetID: "subnet-c"}, // pinned via pre-created port
 	})
 
-	_, err := g.createInstance(context.Background())
+	_, err := g.createInstance(t.Context())
 	assert.NoError(t, err)
 	require.Len(t, fc.createPortCalls, 2)
 	assert.Equal(t, "subnet-b", fc.createPortCalls[0].SubnetID)
@@ -213,7 +213,7 @@ func TestCreateInstance_SubnetIDPortInheritsSecurityGroups(t *testing.T) {
 	})
 	g.ServerSpec.SecurityGroups = []string{"sg-uuid-1", "sg-uuid-2"}
 
-	_, err := g.createInstance(context.Background())
+	_, err := g.createInstance(t.Context())
 	assert.NoError(t, err)
 	require.Len(t, fc.createPortCalls, 1)
 	assert.Equal(t, []string{"sg-uuid-1", "sg-uuid-2"}, fc.createPortCalls[0].SecurityGroups,
@@ -228,7 +228,7 @@ func TestCreateInstance_SubnetIDPortNoSecurityGroupsWhenUnset(t *testing.T) {
 	// g.ServerSpec.SecurityGroups intentionally left nil — Neutron will
 	// fall back to the tenant default and we should not over-specify.
 
-	_, err := g.createInstance(context.Background())
+	_, err := g.createInstance(t.Context())
 	assert.NoError(t, err)
 	require.Len(t, fc.createPortCalls, 1)
 	assert.Nil(t, fc.createPortCalls[0].SecurityGroups,
@@ -237,7 +237,7 @@ func TestCreateInstance_SubnetIDPortNoSecurityGroupsWhenUnset(t *testing.T) {
 
 // newConnectInfoGroup builds a group whose single instance is ACTIVE and
 // addressable, ready for ConnectInfo to be called against it.
-func newConnectInfoGroup(t *testing.T) (*fakeClient, *InstanceGroup) {
+func newConnectInfoGroup(t *testing.T) *InstanceGroup {
 	t.Helper()
 
 	fc := newFakeClient()
@@ -246,7 +246,7 @@ func newConnectInfoGroup(t *testing.T) (*fakeClient, *InstanceGroup) {
 	g := newTestGroup(fc, nil)
 	g.UseIgnition = true
 
-	return fc, g
+	return g
 }
 
 // createInstance authorizes the plugin's SSH key for os_admin_user when no
@@ -255,11 +255,11 @@ func newConnectInfoGroup(t *testing.T) (*fakeClient, *InstanceGroup) {
 // authentication failed. fleeting's own acceptance suite guards this with
 // require.NotEmpty(t, info.Username).
 func TestConnectInfo_UsernameFallsBackToOSAdminUser(t *testing.T) {
-	_, g := newConnectInfoGroup(t)
+	g := newConnectInfoGroup(t)
 	g.settings = provider.Settings{} // connector_config.username deliberately unset
 	g.imgProps.Store(&openstackclient.ImageProperties{OSAdminUser: "core"})
 
-	info, err := g.ConnectInfo(context.Background(), "server-1")
+	info, err := g.ConnectInfo(t.Context(), "server-1")
 	require.NoError(t, err)
 
 	assert.Equal(t, "core", info.Username)
@@ -268,13 +268,13 @@ func TestConnectInfo_UsernameFallsBackToOSAdminUser(t *testing.T) {
 
 // An explicitly configured username must win over the image property.
 func TestConnectInfo_ConfiguredUsernameWinsOverOSAdminUser(t *testing.T) {
-	_, g := newConnectInfoGroup(t)
+	g := newConnectInfoGroup(t)
 	g.settings = provider.Settings{
 		ConnectorConfig: provider.ConnectorConfig{Username: "operator"},
 	}
 	g.imgProps.Store(&openstackclient.ImageProperties{OSAdminUser: "core"})
 
-	info, err := g.ConnectInfo(context.Background(), "server-1")
+	info, err := g.ConnectInfo(t.Context(), "server-1")
 	require.NoError(t, err)
 
 	assert.Equal(t, "operator", info.Username)
@@ -283,11 +283,11 @@ func TestConnectInfo_ConfiguredUsernameWinsOverOSAdminUser(t *testing.T) {
 // With neither source available, fail loudly rather than handing the
 // connector an empty user that dies with an opaque SSH error.
 func TestConnectInfo_ErrorsWhenNoUsernameAvailable(t *testing.T) {
-	_, g := newConnectInfoGroup(t)
+	g := newConnectInfoGroup(t)
 	g.settings = provider.Settings{}
 	g.imgProps.Store(&openstackclient.ImageProperties{})
 
-	_, err := g.ConnectInfo(context.Background(), "server-1")
+	_, err := g.ConnectInfo(t.Context(), "server-1")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "os_admin_user")
 }
@@ -302,7 +302,7 @@ func TestCreateInstance_IgnitionUsesOSAdminUserForKeyInjection(t *testing.T) {
 	g.settings = provider.Settings{}
 	g.imgProps.Store(&openstackclient.ImageProperties{OSAdminUser: "core"})
 
-	_, err := g.createInstance(context.Background())
+	_, err := g.createInstance(t.Context())
 	require.NoError(t, err)
 
 	require.Len(t, fc.createServerCalls, 1)
@@ -345,7 +345,7 @@ func TestCreateInstance_CleanupPortsOnServerFailure(t *testing.T) {
 		{UUID: "n", SubnetID: "s"},
 	})
 
-	id, err := g.createInstance(context.Background())
+	id, err := g.createInstance(t.Context())
 	assert.Error(t, err)
 	assert.Empty(t, id)
 	require.Len(t, fc.createPortCalls, 1, "port should still have been pre-created")

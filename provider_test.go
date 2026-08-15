@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/ports"
 	"github.com/hashicorp/go-hclog"
@@ -33,6 +36,17 @@ type fakeClient struct {
 	createServerErr error
 	getServerErr    error
 
+	// deletePortFunc, when set, overrides DeletePort's return value — lets
+	// tests simulate Neutron's 409 conflict / 404 not-found responses
+	// during the Nova server-teardown race.
+	deletePortFunc func(portID string) error
+
+	// createdPortsByID and portsByDevice track the port<->server
+	// association CreatePort/CreateServer establish, so ListPortsByDeviceID
+	// can answer Decrease's pre-deletion port lookup like the real API does.
+	createdPortsByID map[string]ports.Port
+	portsByDevice    map[string][]ports.Port
+
 	// server, when set, is returned by GetServer — lets ConnectInfo tests
 	// present an instance that has reached ACTIVE with an address.
 	server *servers.Server
@@ -52,7 +66,12 @@ func newFakeClient() *fakeClient { return &fakeClient{} }
 func (f *fakeClient) CreatePort(_ context.Context, networkID, subnetID, description string, securityGroups []string) (*ports.Port, error) {
 	id := fmt.Sprintf("port-%d", f.nextPortID.Add(1))
 	f.createPortCalls = append(f.createPortCalls, createPortCall{networkID, subnetID, description, securityGroups})
-	return &ports.Port{ID: id, NetworkID: networkID, Description: description}, nil
+	p := ports.Port{ID: id, NetworkID: networkID, Description: description}
+	if f.createdPortsByID == nil {
+		f.createdPortsByID = make(map[string]ports.Port)
+	}
+	f.createdPortsByID[id] = p
+	return &p, nil
 }
 
 func (f *fakeClient) CreateServer(_ context.Context, spec servers.CreateOptsBuilder, _ servers.SchedulerHintOptsBuilder) (*servers.Server, error) {
@@ -64,11 +83,25 @@ func (f *fakeClient) CreateServer(_ context.Context, spec servers.CreateOptsBuil
 		return nil, err
 	}
 	f.createServerCalls = append(f.createServerCalls, createServerCall{sm})
-	return &servers.Server{ID: fmt.Sprintf("server-%d", f.nextServerID.Add(1))}, nil
+
+	id := fmt.Sprintf("server-%d", f.nextServerID.Add(1))
+	for _, portID := range extractPortRefs(sm) {
+		if p, ok := f.createdPortsByID[portID]; ok {
+			if f.portsByDevice == nil {
+				f.portsByDevice = make(map[string][]ports.Port)
+			}
+			f.portsByDevice[id] = append(f.portsByDevice[id], p)
+		}
+	}
+
+	return &servers.Server{ID: id}, nil
 }
 
 func (f *fakeClient) DeletePort(_ context.Context, portID string) error {
 	f.deletePortCalls = append(f.deletePortCalls, portID)
+	if f.deletePortFunc != nil {
+		return f.deletePortFunc(portID)
+	}
 	return nil
 }
 
@@ -99,8 +132,35 @@ func (f *fakeClient) GetServer(_ context.Context, _ string) (*servers.Server, er
 }
 func (f *fakeClient) ListServers(_ context.Context) ([]servers.Server, error) { return nil, nil }
 func (f *fakeClient) DeleteServer(_ context.Context, _ string) error          { return nil }
-func (f *fakeClient) ListPortsByDeviceID(_ context.Context, _ string) ([]ports.Port, error) {
-	return nil, nil
+func (f *fakeClient) ListPortsByDeviceID(_ context.Context, deviceID string) ([]ports.Port, error) {
+	return f.portsByDevice[deviceID], nil
+}
+
+// extractPortRefs pulls the per-network "port" values out of a CreateServer
+// payload. ToServerCreateMap returns a heterogeneous map[string]any (the
+// networks slice keeps its concrete []servers.Network type rather than
+// []interface{}), so we round-trip through JSON to get a uniformly-typed
+// structure to walk.
+func extractPortRefs(specMap map[string]interface{}) []string {
+	raw, err := json.Marshal(specMap)
+	if err != nil {
+		return nil
+	}
+	var parsed struct {
+		Server struct {
+			Networks []map[string]string `json:"networks"`
+		} `json:"server"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(parsed.Server.Networks))
+	for _, n := range parsed.Server.Networks {
+		if p, ok := n["port"]; ok {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // newTestGroup builds an InstanceGroup wired to fc, with reasonable
@@ -139,21 +199,7 @@ func serverNameFromCall(t *testing.T, call createServerCall) string {
 // round-trip through JSON to get a uniformly-typed structure to walk.
 func portRefsFromCall(t *testing.T, call createServerCall) []string {
 	t.Helper()
-	raw, err := json.Marshal(call.SpecMap)
-	require.NoError(t, err)
-	var parsed struct {
-		Server struct {
-			Networks []map[string]string `json:"networks"`
-		} `json:"server"`
-	}
-	require.NoError(t, json.Unmarshal(raw, &parsed))
-	out := make([]string, 0, len(parsed.Server.Networks))
-	for _, n := range parsed.Server.Networks {
-		if p, ok := n["port"]; ok {
-			out = append(out, p)
-		}
-	}
-	return out
+	return extractPortRefs(call.SpecMap)
 }
 
 // Regression test for the shared-slice bug: createInstance used to mutate
@@ -475,4 +521,105 @@ func TestSuspendResume_ReportNotSupported(t *testing.T) {
 	succeeded, err = g.Resume(t.Context(), []string{"server-1"})
 	require.Nil(t, succeeded)
 	require.ErrorIs(t, err, provider.ErrSuspendResumeNotSupported)
+}
+
+// respondWithStatus builds the gophercloud error DeletePort returns for a
+// given HTTP status, matching what gophercloud.ResponseCodeIs checks for.
+func respondWithStatus(status int) error {
+	return gophercloud.ErrUnexpectedResponseCode{Actual: status}
+}
+
+// DELETE /servers/{id} answers before Nova finishes detaching the server's
+// ports in the background, so an immediate DeletePort on a pre-created port
+// can race that teardown and see a 409 while the port is still owned by the
+// still-deleting server. This test simulates exactly one such conflict and
+// asserts deletePortRetryingConflict retries rather than giving up — it
+// takes ~1s of real wall-clock time because gophercloud.WaitFor polls on a
+// fixed 1-second ticker.
+func TestDeletePortRetryingConflict_RetriesOnConflictThenSucceeds(t *testing.T) {
+	fc := newFakeClient()
+	attempts := 0
+	fc.deletePortFunc = func(string) error {
+		attempts++
+		if attempts == 1 {
+			return respondWithStatus(http.StatusConflict)
+		}
+		return nil
+	}
+	g := newTestGroup(fc, nil)
+
+	err := g.deletePortRetryingConflict(t.Context(), "port-1")
+	require.NoError(t, err)
+	assert.Equal(t, 2, attempts)
+}
+
+// A 404 means the port is already gone — Nova's own teardown or a previous
+// attempt beat us to it — and must be treated as success, not an error.
+func TestDeletePortRetryingConflict_NotFoundIsSuccess(t *testing.T) {
+	fc := newFakeClient()
+	fc.deletePortFunc = func(string) error {
+		return respondWithStatus(http.StatusNotFound)
+	}
+	g := newTestGroup(fc, nil)
+
+	require.NoError(t, g.deletePortRetryingConflict(t.Context(), "port-1"))
+	assert.Len(t, fc.deletePortCalls, 1, "404 must not be retried")
+}
+
+// A port that is never released (e.g. the server delete itself failed
+// server-side) must not retry forever — deletePortRetryingConflict gives up
+// once its context deadline passes and returns that error to the caller.
+func TestDeletePortRetryingConflict_GivesUpWhenContextExpires(t *testing.T) {
+	fc := newFakeClient()
+	fc.deletePortFunc = func(string) error {
+		return respondWithStatus(http.StatusConflict)
+	}
+	g := newTestGroup(fc, nil)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	err := g.deletePortRetryingConflict(ctx, "port-1")
+	require.Error(t, err)
+	assert.GreaterOrEqual(t, len(fc.deletePortCalls), 1)
+}
+
+// Errors other than 409/404 (e.g. auth failures, 500s) are real failures,
+// not the teardown race, and must not be retried.
+func TestDeletePortRetryingConflict_OtherErrorsAreNotRetried(t *testing.T) {
+	fc := newFakeClient()
+	wantErr := errors.New("boom")
+	fc.deletePortFunc = func(string) error {
+		return wantErr
+	}
+	g := newTestGroup(fc, nil)
+
+	err := g.deletePortRetryingConflict(t.Context(), "port-1")
+	require.ErrorIs(t, err, wantErr)
+	assert.Len(t, fc.deletePortCalls, 1)
+}
+
+// End-to-end through Decrease: a port that loses the teardown race once
+// still gets cleaned up, and the instance is still reported as
+// successfully deleted (port cleanup failures never fail the deletion —
+// the server really is gone either way).
+func TestDecrease_PortCleanupRetriesConflictThenSucceeds(t *testing.T) {
+	fc := newFakeClient()
+	attempts := 0
+	fc.deletePortFunc = func(string) error {
+		attempts++
+		if attempts == 1 {
+			return respondWithStatus(http.StatusConflict)
+		}
+		return nil
+	}
+	g := newTestGroup(fc, []PluginNetwork{{UUID: "network-uuid", SubnetID: "subnet-uuid"}})
+
+	id, err := g.createInstance(t.Context())
+	require.NoError(t, err)
+
+	succeeded, err := g.Decrease(t.Context(), []string{id})
+	require.NoError(t, err)
+	assert.Equal(t, []string{id}, succeeded)
+	assert.Equal(t, 2, attempts)
 }

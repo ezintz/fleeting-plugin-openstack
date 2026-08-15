@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"path"
 	"slices"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ezintz/fleeting-plugin-openstack/internal/openstackclient"
+	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
 	"github.com/hashicorp/go-hclog"
 	"github.com/jinzhu/copier"
@@ -434,12 +436,45 @@ func (g *InstanceGroup) resolveUsername() (string, error) {
 }
 
 // cleanupPorts deletes a list of pre-created ports, logging any errors.
+// portCleanupTimeout bounds how long cleanupPorts retries a single port
+// against Nova's asynchronous server teardown (see deletePortRetryingConflict).
+const portCleanupTimeout = 30 * time.Second
+
 func (g *InstanceGroup) cleanupPorts(ctx context.Context, portIDs []string) {
 	for _, portID := range portIDs {
-		if err := g.client.DeletePort(ctx, portID); err != nil {
+		if err := g.deletePortRetryingConflict(ctx, portID); err != nil {
 			g.log.Error("Failed to clean up port", "port_id", portID, "err", err)
 		}
 	}
+}
+
+// deletePortRetryingConflict deletes a pre-created port, retrying while
+// Neutron reports it as still owned by a device.
+//
+// DELETE /servers/{id} answers before the server is actually gone: Nova
+// marks it "deleting" and detaches its ports in the background. A port we
+// pre-created and handed to Nova at boot is still owned by that
+// still-deleting server for a window after the call returns, so an
+// immediate DeletePort races that teardown and fails with 409 Conflict.
+// Poll until Neutron releases the port, treating 404 (already gone — Nova's
+// own cleanup or a previous attempt beat us to it) as success.
+func (g *InstanceGroup) deletePortRetryingConflict(ctx context.Context, portID string) error {
+	waitCtx, cancel := context.WithTimeout(ctx, portCleanupTimeout)
+	defer cancel()
+
+	return gophercloud.WaitFor(waitCtx, func(ctx context.Context) (bool, error) {
+		err := g.client.DeletePort(ctx, portID)
+		switch {
+		case err == nil:
+			return true, nil
+		case gophercloud.ResponseCodeIs(err, http.StatusNotFound):
+			return true, nil
+		case gophercloud.ResponseCodeIs(err, http.StatusConflict):
+			return false, nil
+		default:
+			return true, err
+		}
+	})
 }
 
 // ConnectInfo returns the address, account and credentials the runner needs to

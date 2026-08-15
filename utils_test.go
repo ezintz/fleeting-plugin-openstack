@@ -206,10 +206,11 @@ func TestInsertSSHKeyIgn(t *testing.T) {
 	}
 }
 
-// selectConnectAddress must be deterministic: Go deliberately randomizes map
-// iteration order, so running the same input repeatedly is how a regression
-// to "whichever address the range loop visits last" would actually show up.
-func TestSelectConnectAddress_Deterministic(t *testing.T) {
+// selectConnectAddresses must be deterministic: Go deliberately randomizes
+// map iteration order, so running the same input repeatedly is how a
+// regression to "whichever address the range loop visits last" would
+// actually show up.
+func TestSelectConnectAddresses_Deterministic(t *testing.T) {
 	netAddrs := map[string][]Address{
 		"tenant-a": {{Address: "10.0.0.5", Version: 4, Type: "fixed"}},
 		"tenant-b": {{Address: "10.0.1.5", Version: 4, Type: "fixed"}},
@@ -217,31 +218,84 @@ func TestSelectConnectAddress_Deterministic(t *testing.T) {
 		"tenant-d": {{Address: "10.0.3.5", Version: 4, Type: "fixed"}},
 	}
 
-	first := selectConnectAddress(netAddrs)
-	for i := 0; i < 50; i++ {
-		require.Equal(t, first, selectConnectAddress(netAddrs), "must return the same address on every call for the same input")
+	wantInternal, wantExternal := selectConnectAddresses(netAddrs)
+	for range 50 {
+		gotInternal, gotExternal := selectConnectAddresses(netAddrs)
+		require.Equal(t, wantInternal, gotInternal, "must return the same internal address on every call for the same input")
+		require.Equal(t, wantExternal, gotExternal, "must return the same external address on every call for the same input")
 	}
 }
 
-func TestSelectConnectAddress_PrefersFloatingOverFixed(t *testing.T) {
+// The runner's connector dials InternalAddr unless use_external_addr is set,
+// and that defaults to false — so the fixed (tenant-internal) address has to
+// land there. Reporting the floating address as internal would route a
+// same-network runner out through NAT and back, or fail entirely on clouds
+// without hairpin NAT.
+func TestSelectConnectAddresses_FixedIsInternalFloatingIsExternal(t *testing.T) {
 	netAddrs := map[string][]Address{
-		"tenant": {{Address: "10.0.0.5", Version: 4, Type: "fixed"}},
-		"public": {{Address: "203.0.113.9", Version: 4, Type: "floating"}},
+		"tenant": {
+			{Address: "10.0.0.5", Version: 4, Type: "fixed"},
+			{Address: "203.0.113.9", Version: 4, Type: "floating"},
+		},
 	}
 
-	assert.Equal(t, "203.0.113.9", selectConnectAddress(netAddrs))
+	internal, external := selectConnectAddresses(netAddrs)
+	assert.Equal(t, "10.0.0.5", internal)
+	assert.Equal(t, "203.0.113.9", external)
 }
 
-func TestSelectConnectAddress_FloatingBeatsFixedRegardlessOfIPVersion(t *testing.T) {
+// An IP version mismatch must not shuffle an address into the wrong role:
+// the class (fixed vs floating) decides which endpoint it fills, and the
+// version only orders candidates within a class.
+func TestSelectConnectAddresses_ClassWinsOverIPVersion(t *testing.T) {
 	netAddrs := map[string][]Address{
 		"tenant": {{Address: "10.0.0.5", Version: 4, Type: "fixed"}},
 		"public": {{Address: "2001:db8::1", Version: 6, Type: "floating"}},
 	}
 
-	assert.Equal(t, "2001:db8::1", selectConnectAddress(netAddrs), "reachability (floating) outranks IP version preference")
+	internal, external := selectConnectAddresses(netAddrs)
+	assert.Equal(t, "10.0.0.5", internal)
+	assert.Equal(t, "2001:db8::1", external)
 }
 
-func TestSelectConnectAddress_PrefersIPv4OverIPv6WhenTypeTies(t *testing.T) {
+// With only fixed addresses there is nothing externally routable to report,
+// so both endpoints fall back to the internal one — an address the runner
+// might not reach still beats no address at all.
+func TestSelectConnectAddresses_FixedOnlyFillsBothEndpoints(t *testing.T) {
+	netAddrs := map[string][]Address{
+		"tenant": {{Address: "10.0.0.5", Version: 4, Type: "fixed"}},
+	}
+
+	internal, external := selectConnectAddresses(netAddrs)
+	assert.Equal(t, "10.0.0.5", internal)
+	assert.Equal(t, "10.0.0.5", external)
+}
+
+// ... and symmetrically for an instance that only has a floating address.
+func TestSelectConnectAddresses_FloatingOnlyFillsBothEndpoints(t *testing.T) {
+	netAddrs := map[string][]Address{
+		"public": {{Address: "203.0.113.9", Version: 4, Type: "floating"}},
+	}
+
+	internal, external := selectConnectAddresses(netAddrs)
+	assert.Equal(t, "203.0.113.9", internal)
+	assert.Equal(t, "203.0.113.9", external)
+}
+
+// Nova omits OS-EXT-IPS:type on some responses; an address with no type is
+// not floating, so it must be treated as the tenant-internal one.
+func TestSelectConnectAddresses_UntypedAddressIsTreatedAsFixed(t *testing.T) {
+	netAddrs := map[string][]Address{
+		"tenant": {{Address: "10.0.0.5", Version: 4}},
+		"public": {{Address: "203.0.113.9", Version: 4, Type: "floating"}},
+	}
+
+	internal, external := selectConnectAddresses(netAddrs)
+	assert.Equal(t, "10.0.0.5", internal)
+	assert.Equal(t, "203.0.113.9", external)
+}
+
+func TestSelectConnectAddresses_PrefersIPv4OverIPv6WithinAClass(t *testing.T) {
 	netAddrs := map[string][]Address{
 		"dualstack": {
 			{Address: "2001:db8::1", Version: 6, Type: "fixed"},
@@ -249,19 +303,26 @@ func TestSelectConnectAddress_PrefersIPv4OverIPv6WhenTypeTies(t *testing.T) {
 		},
 	}
 
-	assert.Equal(t, "10.0.0.5", selectConnectAddress(netAddrs))
+	internal, _ := selectConnectAddresses(netAddrs)
+	assert.Equal(t, "10.0.0.5", internal)
 }
 
-func TestSelectConnectAddress_TieBreaksByNetworkThenAddress(t *testing.T) {
+func TestSelectConnectAddresses_TieBreaksByNetworkThenAddress(t *testing.T) {
 	netAddrs := map[string][]Address{
 		"net-b": {{Address: "10.0.1.5", Version: 4, Type: "fixed"}},
 		"net-a": {{Address: "10.0.0.9", Version: 4, Type: "fixed"}},
 	}
 
-	assert.Equal(t, "10.0.0.9", selectConnectAddress(netAddrs), "lowest network name wins when rank ties")
+	internal, _ := selectConnectAddresses(netAddrs)
+	assert.Equal(t, "10.0.0.9", internal, "lowest network name wins when rank ties")
 }
 
-func TestSelectConnectAddress_EmptyReturnsEmptyString(t *testing.T) {
-	assert.Equal(t, "", selectConnectAddress(nil))
-	assert.Equal(t, "", selectConnectAddress(map[string][]Address{}))
+func TestSelectConnectAddresses_EmptyReturnsEmptyStrings(t *testing.T) {
+	internal, external := selectConnectAddresses(nil)
+	assert.Equal(t, "", internal)
+	assert.Equal(t, "", external)
+
+	internal, external = selectConnectAddresses(map[string][]Address{})
+	assert.Equal(t, "", internal)
+	assert.Equal(t, "", external)
 }

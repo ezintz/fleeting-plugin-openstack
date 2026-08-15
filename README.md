@@ -108,6 +108,37 @@ authorize the plugin's SSH key (via Ignition) and to open the connection,
 so the two cannot drift apart. If neither is set, the plugin fails with a
 clear error rather than silently using the wrong user.
 
+### Which address the runner connects to
+
+The plugin reports an instance's **fixed** (tenant-internal) address as
+`internal_addr` and its **floating** (externally routable) address as
+`external_addr`. GitLab Runner dials `internal_addr` unless you set
+`use_external_addr = true` in `[runners.autoscaler.connector_config]`, so:
+
+- Runner **inside the same tenant network** as its workers — the default —
+  connects over the fixed address. No floating IP is needed at all.
+- Runner **outside** the tenant — set `use_external_addr = true` and give
+  the workers floating IPs.
+
+If an instance only has one kind of address, both fields report it. When
+several addresses qualify, IPv4 is preferred over IPv6 and the choice is
+stable across calls. Setting `accessIPv4` on the server overrides all of
+this and is used for both fields.
+
+### Instances the plugin deletes on its own
+
+Besides the instances GitLab Runner asks it to remove, the plugin deletes
+any instance in its group that Nova reports as `ERROR`, `SHUTOFF`,
+`UNKNOWN` or `DELETED`. The runner never issues a removal for these on its
+own initiative, so without this they would sit in the tenant consuming
+quota forever.
+
+Note this includes an instance that was stopped rather than broken — by a
+guest-initiated shutdown, a host evacuation, or an `openstack server stop`.
+CI workers are ephemeral, so there is nothing to preserve, but don't use a
+group's `name` metadata tag on an instance you intend to stop and restart
+by hand.
+
 
 OpenStack setup
 ---------------

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,10 +27,15 @@ import (
 // fakeClient is a hand-rolled mock of openstackclient.Client for unit
 // testing createInstance. Only the methods exercised by the tests have
 // meaningful behaviour; the rest satisfy the interface with zero values.
+//
+// Decrease deletes instances concurrently and cleanupPorts deletes an
+// instance's ports concurrently, so every method that records a call or
+// touches the shared maps holds mu.
 type fakeClient struct {
 	nextPortID   atomic.Int64
 	nextServerID atomic.Int64
 
+	mu                sync.Mutex
 	createPortCalls   []createPortCall
 	createServerCalls []createServerCall
 	deletePortCalls   []string
@@ -60,6 +67,12 @@ type fakeClient struct {
 	// listServersResult, when set, is returned by ListServers — lets Update
 	// tests present a group's current instances.
 	listServersResult []servers.Server
+
+	// listServersErr and consoleOutputErr, when set, make ListServers /
+	// ShowServerConsoleOutput fail — the two API failures Update has to
+	// treat differently (fatal to the cycle vs. per-instance).
+	listServersErr   error
+	consoleOutputErr error
 }
 
 type createPortCall struct {
@@ -74,6 +87,9 @@ type createServerCall struct {
 func newFakeClient() *fakeClient { return &fakeClient{} }
 
 func (f *fakeClient) CreatePort(_ context.Context, networkID, subnetID, description string, securityGroups []string) (*ports.Port, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	id := fmt.Sprintf("port-%d", f.nextPortID.Add(1))
 	f.createPortCalls = append(f.createPortCalls, createPortCall{networkID, subnetID, description, securityGroups})
 	p := ports.Port{ID: id, NetworkID: networkID, Description: description}
@@ -92,6 +108,10 @@ func (f *fakeClient) CreateServer(_ context.Context, spec servers.CreateOptsBuil
 	if err != nil {
 		return nil, err
 	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	f.createServerCalls = append(f.createServerCalls, createServerCall{sm})
 
 	id := fmt.Sprintf("server-%d", f.nextServerID.Add(1))
@@ -108,9 +128,13 @@ func (f *fakeClient) CreateServer(_ context.Context, spec servers.CreateOptsBuil
 }
 
 func (f *fakeClient) DeletePort(_ context.Context, portID string) error {
+	f.mu.Lock()
 	f.deletePortCalls = append(f.deletePortCalls, portID)
-	if f.deletePortFunc != nil {
-		return f.deletePortFunc(portID)
+	deletePortFunc := f.deletePortFunc
+	f.mu.Unlock()
+
+	if deletePortFunc != nil {
+		return deletePortFunc(portID)
 	}
 	return nil
 }
@@ -129,6 +153,9 @@ func (f *fakeClient) GetFlavorByName(_ context.Context, _ string) (string, error
 	return "", nil
 }
 func (f *fakeClient) ShowServerConsoleOutput(_ context.Context, _ string) (string, error) {
+	if f.consoleOutputErr != nil {
+		return "", f.consoleOutputErr
+	}
 	return "", nil
 }
 func (f *fakeClient) GetServer(_ context.Context, _ string) (*servers.Server, error) {
@@ -141,18 +168,53 @@ func (f *fakeClient) GetServer(_ context.Context, _ string) (*servers.Server, er
 	return &servers.Server{}, nil
 }
 func (f *fakeClient) ListServers(_ context.Context) ([]servers.Server, error) {
+	if f.listServersErr != nil {
+		return nil, f.listServersErr
+	}
 	return f.listServersResult, nil
 }
 
 func (f *fakeClient) DeleteServer(_ context.Context, serverID string) error {
+	f.mu.Lock()
 	f.deleteServerCalls = append(f.deleteServerCalls, serverID)
-	if f.deleteServerFunc != nil {
-		return f.deleteServerFunc(serverID)
+	deleteServerFunc := f.deleteServerFunc
+	f.mu.Unlock()
+
+	if deleteServerFunc != nil {
+		return deleteServerFunc(serverID)
 	}
 	return nil
 }
+
 func (f *fakeClient) ListPortsByDeviceID(_ context.Context, deviceID string) ([]ports.Port, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	return f.portsByDevice[deviceID], nil
+}
+
+// deletedServers returns the recorded DeleteServer calls, sorted so tests
+// can assert on them regardless of the order concurrent deletes finished in.
+func (f *fakeClient) deletedServers() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := slices.Clone(f.deleteServerCalls)
+	slices.Sort(out)
+
+	return out
+}
+
+// deletedPorts returns the recorded DeletePort calls, sorted; see
+// deletedServers.
+func (f *fakeClient) deletedPorts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := slices.Clone(f.deletePortCalls)
+	slices.Sort(out)
+
+	return out
 }
 
 // extractPortRefs pulls the per-network "port" values out of a CreateServer
@@ -717,21 +779,80 @@ func TestUpdate_ErrorInstanceCleansUpItsPorts(t *testing.T) {
 	require.Equal(t, []string{"port-1"}, fc.deletePortCalls)
 }
 
-// If DeleteServer itself fails, Update must still report StateDeleting (so
-// the instance stays tracked and gets retried next cycle instead of being
-// silently dropped) and surface the failure so it's not swallowed.
-func TestUpdate_ErrorInstanceDeleteFailureIsReportedButStillRetried(t *testing.T) {
+// A DeleteServer failure must NOT fail the update. fleeting's provisioner
+// treats a non-nil Update as "this snapshot is untrustworthy" and skips
+// provision() for the whole cycle; since the plugin reports these instances
+// as StateDeleting and removal() skips StateDeleting instances, an instance
+// Nova refuses to delete (a locked server, a policy denial) would otherwise
+// stop the group from ever scaling up again. Report StateDeleting so the
+// instance stays tracked and the next cycle retries the delete.
+func TestUpdate_ErrorInstanceDeleteFailureDoesNotFailTheUpdate(t *testing.T) {
 	fc := newFakeClient()
-	wantErr := errors.New("nova unavailable")
-	fc.deleteServerFunc = func(string) error { return wantErr }
+	fc.deleteServerFunc = func(string) error { return errors.New("nova unavailable") }
 	fc.listServersResult = []servers.Server{
 		{ID: "server-1", Status: "ERROR", Metadata: map[string]string{MetadataKey: "test-asg"}},
 	}
 	g := newTestGroup(fc, nil)
 
 	calls, err := collectUpdates(g, t)
-	require.ErrorIs(t, err, wantErr)
+	require.NoError(t, err, "a per-instance delete failure must not fail the whole update cycle")
 	require.Equal(t, []updateCall{{"server-1", provider.StateDeleting}}, calls)
+
+	// Second cycle: the instance is still listed, so the delete is retried.
+	calls, err = collectUpdates(g, t)
+	require.NoError(t, err)
+	require.Equal(t, []updateCall{{"server-1", provider.StateDeleting}}, calls)
+	require.Equal(t, []string{"server-1", "server-1"}, fc.deletedServers(), "the failed delete must be retried next cycle")
+}
+
+// A healthy instance in the same batch must still be reported normally when
+// a sibling's delete fails — the failure is contained to its own instance.
+func TestUpdate_DeleteFailureDoesNotSuppressHealthyInstances(t *testing.T) {
+	fc := newFakeClient()
+	fc.deleteServerFunc = func(string) error { return errors.New("nova unavailable") }
+	fc.listServersResult = []servers.Server{
+		{ID: "broken", Status: "ERROR", Metadata: map[string]string{MetadataKey: "test-asg"}},
+		{ID: "healthy", Status: "ACTIVE", Created: time.Now().Add(-time.Hour), Metadata: map[string]string{MetadataKey: "test-asg"}},
+	}
+	g := newTestGroup(fc, nil)
+
+	calls, err := collectUpdates(g, t)
+	require.NoError(t, err)
+	require.Equal(t, []updateCall{
+		{"broken", provider.StateDeleting},
+		{"healthy", provider.StateRunning},
+	}, calls)
+}
+
+// Console output isn't always available the moment a server reports ACTIVE.
+// That must leave the instance reported as still creating, not drop it from
+// the update entirely: an unreported instance accumulates missed updates and
+// the provisioner prunes it as timed out after five of them, while the real
+// server keeps running and billing.
+func TestUpdate_ConsoleOutputFailureStillReportsInstance(t *testing.T) {
+	fc := newFakeClient()
+	fc.consoleOutputErr = errors.New("console not available yet")
+	fc.listServersResult = []servers.Server{
+		{ID: "server-1", Status: "ACTIVE", Created: time.Now(), Metadata: map[string]string{MetadataKey: "test-asg"}},
+	}
+	g := newTestGroup(fc, nil)
+	g.BootTime = time.Hour // force the console-output path
+
+	calls, err := collectUpdates(g, t)
+	require.NoError(t, err, "an unreadable console log means 'not ready yet', not a failed cycle")
+	require.Equal(t, []updateCall{{"server-1", provider.StateCreating}}, calls)
+}
+
+// Failing to enumerate the group at all IS fatal to the cycle: the snapshot
+// really is untrustworthy, and acting on it could double-provision.
+func TestUpdate_ListServersFailureIsReturned(t *testing.T) {
+	fc := newFakeClient()
+	wantErr := errors.New("nova unreachable")
+	fc.listServersErr = wantErr
+	g := newTestGroup(fc, nil)
+
+	_, err := collectUpdates(g, t)
+	require.ErrorIs(t, err, wantErr)
 }
 
 // runners.autoscaler.connector_config lets an operator set protocol/os/arch
@@ -784,4 +905,229 @@ func TestConnectInfo_NoImagePropertiesDefaultsToLinuxAmd64SSH(t *testing.T) {
 	assert.Equal(t, provider.ProtocolSSH, info.Protocol)
 	assert.Equal(t, "linux", info.OS)
 	assert.Equal(t, "amd64", info.Arch)
+}
+
+// copier.Copy is shallow for maps and slices, so every field createInstance
+// mutates has to be cloned first. Metadata is the subtle one: without the
+// clone, tagging the instance with MetadataKey writes straight through into
+// g.ServerSpec.Metadata, leaving the operator's configured spec permanently
+// modified — and mutated concurrently if Increase ever runs in parallel.
+func TestCreateInstance_DoesNotMutateSourceSpecMetadata(t *testing.T) {
+	fc := newFakeClient()
+	g := newTestGroup(fc, nil)
+	g.ServerSpec.Metadata = map[string]string{"owner": "platform"}
+
+	_, err := g.createInstance(t.Context())
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]string{"owner": "platform"}, g.ServerSpec.Metadata,
+		"the group's configured metadata must not gain the per-instance cluster tag")
+
+	// The tag must still reach Nova on the instance itself.
+	require.Len(t, fc.createServerCalls, 1)
+	assert.Equal(t, map[string]any{"owner": "platform", MetadataKey: "test-asg"},
+		serverFieldFromCall(t, fc.createServerCalls[0], "metadata"))
+}
+
+// Same aliasing hazard for the boot-volume block device, and for Metadata
+// again. Sequentially the block-device append is invisible (it writes past
+// the source slice's length), so the failure mode only shows up when two
+// creates overlap: both write the same shared backing array and the same
+// shared map. Run under -race, this is what proves the clones are load
+// bearing rather than decorative.
+func TestCreateInstance_ConcurrentCreatesDoNotShareSpecState(t *testing.T) {
+	fc := newFakeClient()
+	g := newTestGroup(fc, nil)
+	g.ServerSpec.ImageRef = "image-uuid"
+	g.ServerSpec.Metadata = map[string]string{"owner": "platform"}
+	// A data volume the operator configured, in a slice with spare
+	// capacity — so an un-cloned append writes in place instead of
+	// reallocating.
+	g.ServerSpec.BlockDevice = append(make([]servers.BlockDevice, 0, 4), servers.BlockDevice{
+		BootIndex:       -1,
+		SourceType:      servers.SourceBlank,
+		DestinationType: servers.DestinationVolume,
+		VolumeSize:      10,
+	})
+	g.VolumeType = "ssd"
+	g.VolumeSize = 40
+
+	const concurrency = 8
+
+	var wg sync.WaitGroup
+	for range concurrency {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			_, err := g.createInstance(t.Context())
+			assert.NoError(t, err)
+		}()
+	}
+
+	wg.Wait()
+
+	assert.Equal(t, map[string]string{"owner": "platform"}, g.ServerSpec.Metadata,
+		"the group's configured metadata must not gain the per-instance cluster tag")
+	assert.Len(t, g.ServerSpec.BlockDevice, 1,
+		"the group's configured block devices must not accumulate boot volumes")
+
+	require.Len(t, fc.createServerCalls, concurrency)
+	for i, call := range fc.createServerCalls {
+		bdm, ok := serverFieldFromCall(t, call, "block_device_mapping_v2").([]any)
+		require.True(t, ok, "call %d has no block device mapping", i)
+		assert.Len(t, bdm, 2, "call %d must carry the operator's data volume plus exactly one boot volume", i)
+	}
+}
+
+// Decrease deletes concurrently so a batch can't stall the provisioner's
+// single reconcile goroutine for portCleanupTimeout per instance. The
+// succeeded list must still come back in the caller's order.
+func TestDecrease_DeletesConcurrentlyAndPreservesOrder(t *testing.T) {
+	fc := newFakeClient()
+	g := newTestGroup(fc, nil)
+
+	ids := []string{"server-c", "server-a", "server-b"}
+
+	succeeded, err := g.Decrease(t.Context(), ids)
+	require.NoError(t, err)
+	assert.Equal(t, ids, succeeded, "succeeded must mirror the caller's order, not completion order")
+	assert.Equal(t, []string{"server-a", "server-b", "server-c"}, fc.deletedServers())
+}
+
+// A batch where one instance fails must still report the rest as deleted,
+// and must attribute the error rather than dropping it.
+func TestDecrease_PartialFailureReportsTheRest(t *testing.T) {
+	fc := newFakeClient()
+	wantErr := errors.New("nova unavailable")
+	fc.deleteServerFunc = func(serverID string) error {
+		if serverID == "server-b" {
+			return wantErr
+		}
+
+		return nil
+	}
+	g := newTestGroup(fc, nil)
+
+	succeeded, err := g.Decrease(t.Context(), []string{"server-a", "server-b", "server-c"})
+	require.ErrorIs(t, err, wantErr)
+	assert.Equal(t, []string{"server-a", "server-c"}, succeeded)
+}
+
+// portCleanupTimeout is a budget for the whole cleanup, not per port: an
+// instance's ports are released by the same background teardown at roughly
+// the same moment, so charging each port its own timeout would multiply the
+// worst-case stall for no benefit. Ports are therefore deleted concurrently
+// and share one deadline.
+func TestCleanupPorts_DeletesConcurrentlyUnderOneDeadline(t *testing.T) {
+	fc := newFakeClient()
+	released := make(chan struct{})
+	fc.deletePortFunc = func(string) error {
+		// Every port stays conflicted until the teardown "completes",
+		// which only happens once all of them are in flight — so this
+		// can only finish if the deletes overlap.
+		<-released
+
+		return nil
+	}
+	g := newTestGroup(fc, nil)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.cleanupPorts(t.Context(), []string{"port-1", "port-2", "port-3"})
+	}()
+
+	require.Eventually(t, func() bool { return len(fc.deletedPorts()) == 3 }, 5*time.Second, 10*time.Millisecond,
+		"all three DeletePort calls must be in flight at once")
+	close(released)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanupPorts did not return")
+	}
+
+	assert.Equal(t, []string{"port-1", "port-2", "port-3"}, fc.deletedPorts())
+}
+
+// The connector dials InternalAddr unless use_external_addr is set, so the
+// fixed address has to land there and the floating one on ExternalAddr —
+// otherwise a runner sharing the tenant network is routed out through NAT.
+func TestConnectInfo_ReportsFixedAsInternalAndFloatingAsExternal(t *testing.T) {
+	fc := newFakeClient()
+	fc.server = &servers.Server{
+		ID:     "server-1",
+		Status: "ACTIVE",
+		Addresses: map[string]any{
+			"tenant": []any{
+				map[string]any{"addr": "10.0.0.5", "version": float64(4), "OS-EXT-IPS:type": "fixed"},
+				map[string]any{"addr": "203.0.113.9", "version": float64(4), "OS-EXT-IPS:type": "floating"},
+			},
+		},
+	}
+
+	g := newTestGroup(fc, nil)
+	g.settings.Username = "core"
+
+	info, err := g.ConnectInfo(t.Context(), "server-1")
+	require.NoError(t, err)
+	assert.Equal(t, "10.0.0.5", info.InternalAddr)
+	assert.Equal(t, "203.0.113.9", info.ExternalAddr)
+}
+
+// An explicitly configured accessIPv4 is the operator naming the address to
+// use, so it wins for both endpoints.
+func TestConnectInfo_AccessIPv4OverridesAddressSelection(t *testing.T) {
+	fc := newFakeClient()
+	fc.server = &servers.Server{
+		ID:         "server-1",
+		Status:     "ACTIVE",
+		AccessIPv4: "192.0.2.7",
+		Addresses: map[string]any{
+			"tenant": []any{
+				map[string]any{"addr": "10.0.0.5", "version": float64(4), "OS-EXT-IPS:type": "fixed"},
+			},
+		},
+	}
+
+	g := newTestGroup(fc, nil)
+	g.settings.Username = "core"
+
+	info, err := g.ConnectInfo(t.Context(), "server-1")
+	require.NoError(t, err)
+	assert.Equal(t, "192.0.2.7", info.InternalAddr)
+	assert.Equal(t, "192.0.2.7", info.ExternalAddr)
+}
+
+// A server Nova no longer knows about is unhealthy, not an API failure —
+// the runner has to stop scheduling onto it rather than retrying a lookup.
+func TestHeartbeat_MissingServerIsUnhealthy(t *testing.T) {
+	fc := newFakeClient()
+	fc.getServerErr = gophercloud.ErrUnexpectedResponseCode{Actual: http.StatusNotFound}
+	g := newTestGroup(fc, nil)
+
+	err := g.Heartbeat(t.Context(), "server-1")
+	require.ErrorIs(t, err, provider.ErrInstanceUnhealthy)
+	assert.Contains(t, err.Error(), "no longer exists")
+}
+
+// serverFieldFromCall reads one field out of the server object in a captured
+// CreateServer payload. ToServerCreateMap returns a heterogeneous
+// map[string]any whose nested values keep their concrete Go types, so this
+// round-trips through JSON for uniformly-typed values to assert on — the
+// same reason extractPortRefs does.
+func serverFieldFromCall(t *testing.T, call createServerCall, field string) any {
+	t.Helper()
+
+	raw, err := json.Marshal(call.SpecMap)
+	require.NoError(t, err)
+
+	var parsed struct {
+		Server map[string]any `json:"server"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &parsed))
+
+	return parsed.Server[field]
 }

@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"path"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -137,13 +139,22 @@ func (g *InstanceGroup) Init(ctx context.Context, log hclog.Logger, settings pro
 // server is only promoted to StateRunning once boot_time has elapsed or its
 // console output shows cloud-init/Ignition has finished, so the runner does
 // not dispatch jobs to a machine that is not ready.
+//
+// Only a failure to enumerate the group at all is returned as an error.
+// Per-instance failures (a delete Nova rejects, console output that isn't
+// available yet) are logged and the instance is reported with its best-known
+// state instead, because the provisioner treats a non-nil Update as "this
+// snapshot is untrustworthy" and skips provision() and suspend() for the
+// whole cycle (see fleeting's provisioner loop). Failing the cycle over one
+// sick instance would stop the group from ever scaling up again: the plugin
+// reports such instances as StateDeleting, and removal() deliberately skips
+// StateDeleting instances, so nothing else would retry them either.
 func (g *InstanceGroup) Update(ctx context.Context, update func(instance string, state provider.State)) error {
 	instances, err := g.getInstances(ctx)
 	if err != nil {
 		return err
 	}
 
-	var reterr error
 	for _, srv := range instances {
 		state := provider.StateCreating
 		lg := g.log.With("server_id", srv.ID, "created", srv.Created, "status", srv.Status)
@@ -172,8 +183,11 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 			}
 
 			if delErr := g.deleteInstance(ctx, srv.ID); delErr != nil {
-				lg.Error("Failed to delete broken instance", "err", delErr)
-				reterr = errors.Join(reterr, delErr)
+				// Logged, not returned: see the note on Update. The
+				// instance is still reported as StateDeleting so the
+				// provisioner keeps tracking it, and the next cycle
+				// retries the delete.
+				lg.Error("Failed to delete broken instance; will retry next cycle", "err", delErr)
 			}
 
 			state = provider.StateDeleting
@@ -183,9 +197,19 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 				// treat all nodes running long enough as Running
 				state = provider.StateRunning
 			} else {
+				// Console output is not always available the moment a
+				// server reports ACTIVE, and some clouds answer with a
+				// transient 409/404 while it is being collected. Treat
+				// that as "not ready yet" and re-check next cycle rather
+				// than failing the update: dropping out of the loop here
+				// would leave the instance unreported, and after five
+				// missed updates the provisioner prunes it as timed out
+				// while the real server keeps running.
 				log, err := g.client.ShowServerConsoleOutput(ctx, srv.ID)
 				if err != nil {
-					reterr = errors.Join(reterr, err)
+					lg.Warn("Failed to read console output; treating instance as still booting", "err", err)
+					update(srv.ID, state)
+
 					continue
 				}
 
@@ -207,7 +231,7 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 		update(srv.ID, state)
 	}
 
-	return reterr
+	return nil
 }
 
 // Increase requests delta additional instances and reports how many creation
@@ -230,19 +254,52 @@ func (g *InstanceGroup) Increase(ctx context.Context, delta int) (succeeded int,
 	return
 }
 
+// maxConcurrentDeletes bounds how many instances Decrease tears down at
+// once. Deleting an instance can block for as long as portCleanupTimeout
+// while Nova detaches its pre-created ports, and the runner's provisioner
+// calls Decrease synchronously from the single goroutine that also drives
+// reconcile and provision — so a serial loop over a large batch would stall
+// all scaling for minutes. The cap keeps that bounded without turning a
+// scale-to-zero into a burst of hundreds of simultaneous API calls.
+const maxConcurrentDeletes = 10
+
 // Decrease deletes the named instances and returns those whose deletion was
 // accepted. Ports the plugin pre-created for a subnet_id are looked up before
 // the server is deleted and removed afterwards.
+//
+// Instances are deleted concurrently (see maxConcurrentDeletes), but
+// succeeded is returned in the caller's order so the result is deterministic.
 func (g *InstanceGroup) Decrease(ctx context.Context, instances []string) (succeeded []string, err error) {
 	if len(instances) == 0 {
 		return nil, nil
 	}
 
+	errs := make([]error, len(instances))
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxConcurrentDeletes)
+
+	for i, id := range instances {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			errs[i] = g.deleteInstance(ctx, id)
+		}()
+	}
+
+	wg.Wait()
+
 	succeeded = make([]string, 0, len(instances))
-	for _, id := range instances {
-		if err2 := g.deleteInstance(ctx, id); err2 != nil {
-			g.log.Error("Failed to delete instance", "err", err2, "id", id)
-			err = errors.Join(err, err2)
+	for i, id := range instances {
+		if errs[i] != nil {
+			g.log.Error("Failed to delete instance", "err", errs[i], "id", id)
+			err = errors.Join(err, errs[i])
+
 			continue
 		}
 
@@ -250,7 +307,7 @@ func (g *InstanceGroup) Decrease(ctx context.Context, instances []string) (succe
 		succeeded = append(succeeded, id)
 	}
 
-	g.log.Info("Decrease", "instances", instances)
+	g.log.Info("Decrease", "instances", instances, "succeeded", len(succeeded))
 
 	return succeeded, err
 }
@@ -308,7 +365,7 @@ func (g *InstanceGroup) getInstances(ctx context.Context) ([]servers.Server, err
 }
 
 // validateNameTemplate rejects a server_spec.name that createInstance cannot
-// expand into a unique per-instance name.
+// expand into a distinct per-instance name.
 //
 // createInstance runs the name through fmt.Sprintf with the group's instance
 // counter, so it has to carry exactly one integer verb. Misuse is not a hard
@@ -316,12 +373,16 @@ func (g *InstanceGroup) getInstances(ctx context.Context) ([]servers.Server, err
 // into the literal server name "runner%!(EXTRA int=1)" and every instance in
 // the group carries that marker for its whole life. Catch it at Init, where
 // the operator still sees the error, rather than at the Nova API.
+//
+// Note the counter is per-process and restarts at zero when the plugin does,
+// so names repeat across restarts. Nova permits that; instance identity comes
+// from the server ID and the MetadataKey label, never the name.
 func validateNameTemplate(name string) error {
 	// Any misuse of the template — no verb, a non-integer verb, or more than
 	// one — shows up as a %!-prefixed error marker in the expansion.
 	if expanded := fmt.Sprintf(name, 1); strings.Contains(expanded, "%!") {
 		return fmt.Errorf(
-			"server_spec.name %q must contain exactly one integer format verb (for example %q) so each instance gets a unique name, but expanding it produced %q",
+			"server_spec.name %q must contain exactly one integer format verb (for example %q) so instances in a group get distinct names, but expanding it produced %q",
 			name, "runner-%d", expanded)
 	}
 
@@ -334,6 +395,15 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
+	// copier.Copy is shallow for maps and slices: spec.Metadata,
+	// spec.BlockDevice and spec.Networks all still alias g.ServerSpec's
+	// backing storage. Every field this function mutates therefore has to
+	// be cloned first, or the per-instance edits below leak into the source
+	// spec and the next createInstance call inherits them. Networks is
+	// handled separately at the port pre-creation loop.
+	spec.Metadata = maps.Clone(g.ServerSpec.Metadata)
+	spec.BlockDevice = slices.Clone(g.ServerSpec.BlockDevice)
 
 	index := int(g.instanceCounter.Add(1))
 
@@ -398,13 +468,11 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 	// desired subnet and pass the port ID to Nova instead.
 	//
 	// Build a fresh networks slice rather than mutating spec.Networks in
-	// place: copier.Copy gives a shallow copy, so spec.Networks shares
-	// backing storage with g.ServerSpec.Networks. Mutating it would leak
-	// per-instance port IDs into the source spec and the next
-	// createInstance call would resubmit the stale port.
+	// place, for the same aliasing reason as Metadata/BlockDevice above:
+	// mutating it would leak per-instance port IDs into the source spec and
+	// the next createInstance call would resubmit the stale port.
 	var createdPortIDs []string
-	networks := make([]PluginNetwork, len(spec.Networks))
-	copy(networks, spec.Networks)
+	networks := slices.Clone(spec.Networks)
 	for i, net := range networks {
 		if net.SubnetID == "" {
 			continue
@@ -469,21 +537,47 @@ func (g *InstanceGroup) resolveUsername() (string, error) {
 	return "", fmt.Errorf("image properties 'os_admin_user' and 'runners.autoscaler.connector_config.username' missing; ensure one is set")
 }
 
-// cleanupPorts deletes a list of pre-created ports, logging any errors.
-// portCleanupTimeout bounds how long cleanupPorts retries a single port
-// against Nova's asynchronous server teardown (see deletePortRetryingConflict).
+// portCleanupTimeout bounds how long cleanupPorts waits for Nova's
+// asynchronous server teardown to release the plugin's pre-created ports
+// (see deletePortRetryingConflict). It is a budget for the whole call, not
+// per port: the ports of one instance are released by the same background
+// teardown at roughly the same moment, so charging each port its own 30s
+// only multiplies the worst case without improving the odds.
 const portCleanupTimeout = 30 * time.Second
 
+// cleanupPorts deletes a set of pre-created ports, logging any errors.
+// Deletion failures are never fatal: the server they belonged to is already
+// gone, and a leaked port is an operator-visible resource, not a broken
+// scaling loop.
 func (g *InstanceGroup) cleanupPorts(ctx context.Context, portIDs []string) {
-	for _, portID := range portIDs {
-		if err := g.deletePortRetryingConflict(ctx, portID); err != nil {
-			g.log.Error("Failed to clean up port", "port_id", portID, "err", err)
-		}
+	if len(portIDs) == 0 {
+		return
 	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, portCleanupTimeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+
+	for _, portID := range portIDs {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			if err := g.deletePortRetryingConflict(waitCtx, portID); err != nil {
+				g.log.Error("Failed to clean up port", "port_id", portID, "err", err)
+			}
+		}()
+	}
+
+	wg.Wait()
 }
 
 // deletePortRetryingConflict deletes a pre-created port, retrying while
-// Neutron reports it as still owned by a device.
+// Neutron reports it as still owned by a device. It retries until ctx is
+// done, so callers are responsible for bounding it — cleanupPorts does that
+// with portCleanupTimeout.
 //
 // DELETE /servers/{id} answers before the server is actually gone: Nova
 // marks it "deleting" and detaches its ports in the background. A port we
@@ -493,10 +587,7 @@ func (g *InstanceGroup) cleanupPorts(ctx context.Context, portIDs []string) {
 // Poll until Neutron releases the port, treating 404 (already gone — Nova's
 // own cleanup or a previous attempt beat us to it) as success.
 func (g *InstanceGroup) deletePortRetryingConflict(ctx context.Context, portID string) error {
-	waitCtx, cancel := context.WithTimeout(ctx, portCleanupTimeout)
-	defer cancel()
-
-	return gophercloud.WaitFor(waitCtx, func(ctx context.Context) (bool, error) {
+	return gophercloud.WaitFor(ctx, func(ctx context.Context) (bool, error) {
 		err := g.client.DeletePort(ctx, portID)
 		switch {
 		case err == nil:
@@ -524,22 +615,24 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (pro
 		return provider.ConnectInfo{}, fmt.Errorf("instance status is not active: %s", srv.Status)
 	}
 
-	ipAddr := srv.AccessIPv4
-	if ipAddr == "" {
+	// An explicitly configured accessIPv4 is the operator telling us which
+	// address to use, so it wins for both endpoints.
+	internalAddr, externalAddr := srv.AccessIPv4, srv.AccessIPv4
+	if srv.AccessIPv4 == "" {
 		netAddrs, err := extractAddresses(srv)
 		if err != nil {
 			return provider.ConnectInfo{}, err
 		}
 
-		ipAddr = selectConnectAddress(netAddrs)
-		g.log.Debug("Use address", "ip_address", ipAddr)
+		internalAddr, externalAddr = selectConnectAddresses(netAddrs)
+		g.log.Debug("Use address", "internal_addr", internalAddr, "external_addr", externalAddr)
 	}
 
 	info := provider.ConnectInfo{
 		ConnectorConfig: g.settings.ConnectorConfig,
 		ID:              instanceID,
-		InternalAddr:    ipAddr,
-		ExternalAddr:    ipAddr,
+		InternalAddr:    internalAddr,
+		ExternalAddr:    externalAddr,
 	}
 
 	// The connector passes this straight to ssh.ClientConfig.User, so an
@@ -632,9 +725,22 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (pro
 // runner calls this before dispatching work to an instance it already
 // believes is running, so it deliberately checks only server status —
 // nothing as slow as an SSH probe.
+//
+// The provider.ErrInstanceUnhealthy wrapping is for local callers and tests
+// only: fleeting's gRPC server returns this as a bare codes.Unknown status
+// carrying just the message text, so errors.Is cannot match the sentinel
+// across the plugin boundary. Any non-nil error already reads as unhealthy
+// there — the wrapping exists so the reason survives in the message.
 func (g *InstanceGroup) Heartbeat(ctx context.Context, instanceID string) error {
 	srv, err := g.client.GetServer(ctx, instanceID)
 	if err != nil {
+		// A server Nova no longer knows about is unhealthy, not an API
+		// failure — distinguish it so the runner stops scheduling onto it
+		// instead of treating the lookup as a transient error.
+		if gophercloud.ResponseCodeIs(err, http.StatusNotFound) {
+			return fmt.Errorf("%w: server %s no longer exists", provider.ErrInstanceUnhealthy, instanceID)
+		}
+
 		return fmt.Errorf("failed to get server %s: %w", instanceID, err)
 	}
 

@@ -140,34 +140,40 @@ func extractAddresses(srv *servers.Server) (map[string][]Address, error) {
 	return ret, nil
 }
 
-// selectConnectAddress picks one address to connect to out of every address
-// extractAddresses found across all of an instance's networks.
+// selectConnectAddresses picks the addresses ConnectInfo reports as an
+// instance's internal and external endpoints, out of every address
+// extractAddresses found across all of its networks.
 //
-// This has to be deterministic: netAddrs is a map, and Go deliberately
-// randomizes map iteration order, so picking "whichever address the range
-// loop visits last" (the previous approach) could return a different
-// network's address on every call — including one the runner can't
-// actually reach.
+// The split matters: GitLab Runner's connector dials InternalAddr unless
+// runners.autoscaler.connector_config.use_external_addr is set, which
+// defaults to false. Reporting a floating address as the internal one would
+// send a runner that shares the tenant network with its workers out through
+// the NAT gateway and back — paying egress for a link it already has, and
+// failing outright on clouds that don't support hairpin NAT. So a fixed
+// (tenant-internal) address becomes internal and a floating (externally
+// routable) one becomes external; Nova's OS-EXT-IPS:type field distinguishes
+// them. When the instance only has one kind, both endpoints fall back to it,
+// since an address the runner might not reach still beats no address at all.
 //
-// Preference order: a floating (externally routable) address over a fixed
-// (tenant-internal) one — Nova's OS-EXT-IPS:type field distinguishes them —
-// then IPv4 over IPv6, then network name and address as a final,
-// arbitrary-but-stable tie-break. Returns "" if netAddrs has no addresses.
-func selectConnectAddress(netAddrs map[string][]Address) string {
+// Selection within each class has to be deterministic: netAddrs is a map,
+// and Go deliberately randomizes map iteration order, so picking "whichever
+// address the range loop visits last" (the original approach) could return a
+// different network's address on every call. Ordering is IPv4 before IPv6,
+// then network name and address as a final, arbitrary-but-stable tie-break.
+//
+// Both return values are "" if netAddrs has no addresses.
+func selectConnectAddresses(netAddrs map[string][]Address) (internal, external string) {
 	type candidate struct {
 		network string
 		addr    Address
 	}
 
 	var candidates []candidate
+
 	for net, addrs := range netAddrs {
 		for _, addr := range addrs {
 			candidates = append(candidates, candidate{net, addr})
 		}
-	}
-
-	if len(candidates) == 0 {
-		return ""
 	}
 
 	slices.SortFunc(candidates, func(a, b candidate) int {
@@ -178,21 +184,46 @@ func selectConnectAddress(netAddrs map[string][]Address) string {
 		)
 	})
 
-	return candidates[0].addr.Address
+	for _, c := range candidates {
+		if isFloating(c.addr) {
+			if external == "" {
+				external = c.addr.Address
+			}
+
+			continue
+		}
+
+		if internal == "" {
+			internal = c.addr.Address
+		}
+	}
+
+	// Only one kind of address available — report it as both.
+	if internal == "" {
+		internal = external
+	}
+
+	if external == "" {
+		external = internal
+	}
+
+	return internal, external
 }
 
-// addressRank scores an address for selectConnectAddress; lower sorts
-// first. A floating address always outranks a fixed one regardless of IP
-// version, since reachability matters more than protocol preference.
+// isFloating reports whether a is an externally routable floating address
+// rather than a tenant-internal fixed one.
+func isFloating(a Address) bool { return a.Type == "floating" }
+
+// addressRank orders addresses within one class (floating or fixed) for
+// selectConnectAddresses; lower sorts first. IPv4 is preferred over IPv6
+// because it is the more universally routable of the two in the runner's
+// own network.
 func addressRank(a Address) int {
-	rank := 0
-	if a.Type != "floating" {
-		rank += 2
+	if a.Version == 4 {
+		return 0
 	}
-	if a.Version != 4 {
-		rank++
-	}
-	return rank
+
+	return 1
 }
 
 var (

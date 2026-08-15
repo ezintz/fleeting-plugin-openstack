@@ -67,7 +67,16 @@ func TestProvisioning(t *testing.T) {
 			Key:                  sshKey,
 			Timeout:              10 * time.Minute,
 		},
-		MaxInstances:    1,
+		// Must be > 1. The harness scales up, then calls
+		// deleteInstances(len(instances)-1) to leave one instance behind
+		// for the connect-and-run-a-command step — but its "delete this
+		// many" argument is guarded by `if n != 0`, so a count of 1
+		// instance makes that argument 0 and deletes *everything*.
+		// executeCommand then finds nothing in StateRunning and silently
+		// skips its whole body, including the require.NotEmpty on
+		// Username that this suite is here to guard. 3 is what the
+		// harness itself caps at.
+		MaxInstances:    3,
 		UseExternalAddr: os.Getenv("FLEETING_TEST_USE_EXTERNAL_ADDR") == "true",
 	})
 }

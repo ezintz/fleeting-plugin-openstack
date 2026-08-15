@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test
@@ -20,4 +23,8 @@ jobs:
         go-version-file: go.mod
       id: go
     - name: Test
-      run: go test -v ./...
+      # -race is required, not a nicety: the tests covering shared spec
+      # state across concurrent createInstance calls and the parallel
+      # Decrease/cleanupPorts teardown pass either way without it, and only
+      # report their bug under the race detector.
+      run: go test -race -v ./...

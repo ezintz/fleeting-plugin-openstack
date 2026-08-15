@@ -9,10 +9,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ezintz/fleeting-plugin-openstack/internal/openstackclient"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
 	"github.com/hashicorp/go-hclog"
 	"github.com/jinzhu/copier"
-	"github.com/ezintz/fleeting-plugin-openstack/internal/openstackclient"
 
 	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
 )

@@ -4,8 +4,11 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  test:
+  lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
@@ -16,4 +19,9 @@ jobs:
       with:
         go-version-file: go.mod
     - name: Run golangci-lint
-      uses: golangci/golangci-lint-action@v8
+      uses: golangci/golangci-lint-action@v9
+      with:
+        # Pin the minor version so CI and local runs agree on which checks
+        # exist; the action still resolves the newest patch release itself.
+        # Linter and formatter selection lives in .golangci.yml.
+        version: v2.12

@@ -1,0 +1,25 @@
+version: "2"
+
+linters:
+  # golangci-lint's default set (errcheck, govet, ineffassign, staticcheck,
+  # unused) plus a few low-noise checks that fit what this plugin does.
+  #
+  # Deliberately not enabled: revive. Its default ruleset is dominated by
+  # `exported` (doc comment required on every exported symbol), which flags
+  # ~47 pre-existing sites. Worth doing as its own pass, not as a side
+  # effect of turning formatting checks on.
+  enable:
+    # The plugin talks to OpenStack over HTTP; a leaked response body is a
+    # slow fd leak in a long-running runner process.
+    - bodyclose
+    - copyloopvar
+    - misspell
+    - unconvert
+
+formatters:
+  # `golangci-lint run` only checks the formatters listed here, so with no
+  # config at all gofmt drift (import ordering, comment alignment) reached
+  # main unnoticed. Listing them makes the existing lint job fail on it.
+  enable:
+    - gofmt
+    - goimports

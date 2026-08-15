@@ -194,9 +194,9 @@ func TestCreateInstance_NoSubnetIDSkipsPortPreCreation(t *testing.T) {
 func TestCreateInstance_MixedNetworksOnlyPreCreatesForSubnetEntries(t *testing.T) {
 	fc := newFakeClient()
 	g := newTestGroup(fc, []PluginNetwork{
-		{UUID: "net-a"},                           // Nova-managed, no port pre-creation
-		{UUID: "net-b", SubnetID: "subnet-b"},     // pinned via pre-created port
-		{UUID: "net-c", SubnetID: "subnet-c"},     // pinned via pre-created port
+		{UUID: "net-a"},                       // Nova-managed, no port pre-creation
+		{UUID: "net-b", SubnetID: "subnet-b"}, // pinned via pre-created port
+		{UUID: "net-c", SubnetID: "subnet-c"}, // pinned via pre-created port
 	})
 
 	_, err := g.createInstance(context.Background())

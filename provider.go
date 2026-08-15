@@ -538,6 +538,35 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (pro
 	return info, nil
 }
 
+// Heartbeat reports whether instanceID is still a usable Nova instance. The
+// runner calls this before dispatching work to an instance it already
+// believes is running, so it deliberately checks only server status —
+// nothing as slow as an SSH probe.
+func (g *InstanceGroup) Heartbeat(ctx context.Context, instanceID string) error {
+	srv, err := g.client.GetServer(ctx, instanceID)
+	if err != nil {
+		return fmt.Errorf("failed to get server %s: %w", instanceID, err)
+	}
+
+	if srv.Status != "ACTIVE" {
+		return fmt.Errorf("%w: status is %s", provider.ErrInstanceUnhealthy, srv.Status)
+	}
+
+	return nil
+}
+
+// Suspend is unimplemented: Init never advertises
+// provider.CapabilitySuspendResume, so the runner's provisioner never calls
+// this — it only forwards Suspend/Resume requests to plugins that opted in.
+func (g *InstanceGroup) Suspend(_ context.Context, _ []string) (succeeded []string, err error) {
+	return nil, provider.ErrSuspendResumeNotSupported
+}
+
+// Resume is unimplemented; see Suspend.
+func (g *InstanceGroup) Resume(_ context.Context, _ []string) (succeeded []string, err error) {
+	return nil, provider.ErrSuspendResumeNotSupported
+}
+
 // Shutdown is a no-op: instances outlive the plugin process and are reclaimed
 // by the runner through Decrease, not at shutdown.
 func (g *InstanceGroup) Shutdown(_ context.Context) error {

@@ -31,6 +31,7 @@ type fakeClient struct {
 	deletePortCalls   []string
 
 	createServerErr error
+	getServerErr    error
 
 	// server, when set, is returned by GetServer — lets ConnectInfo tests
 	// present an instance that has reached ACTIVE with an address.
@@ -88,6 +89,9 @@ func (f *fakeClient) ShowServerConsoleOutput(_ context.Context, _ string) (strin
 	return "", nil
 }
 func (f *fakeClient) GetServer(_ context.Context, _ string) (*servers.Server, error) {
+	if f.getServerErr != nil {
+		return nil, f.getServerErr
+	}
 	if f.server != nil {
 		return f.server, nil
 	}
@@ -426,4 +430,49 @@ func TestCreateInstance_NameTemplateExpandsPerInstance(t *testing.T) {
 	require.Len(t, fc.createServerCalls, 2)
 	require.Equal(t, "runner-1", serverNameFromCall(t, fc.createServerCalls[0]))
 	require.Equal(t, "runner-2", serverNameFromCall(t, fc.createServerCalls[1]))
+}
+
+func TestHeartbeat_ActiveInstanceIsHealthy(t *testing.T) {
+	fc := newFakeClient()
+	fc.server = &servers.Server{ID: "server-1", Status: "ACTIVE"}
+	g := newTestGroup(fc, nil)
+
+	require.NoError(t, g.Heartbeat(t.Context(), "server-1"))
+}
+
+func TestHeartbeat_NonActiveInstanceIsUnhealthy(t *testing.T) {
+	fc := newFakeClient()
+	fc.server = &servers.Server{ID: "server-1", Status: "SHUTOFF"}
+	g := newTestGroup(fc, nil)
+
+	err := g.Heartbeat(t.Context(), "server-1")
+	require.Error(t, err)
+	require.ErrorIs(t, err, provider.ErrInstanceUnhealthy)
+	require.Contains(t, err.Error(), "SHUTOFF")
+}
+
+func TestHeartbeat_GetServerErrorPropagates(t *testing.T) {
+	fc := newFakeClient()
+	fc.getServerErr = errors.New("boom")
+	g := newTestGroup(fc, nil)
+
+	err := g.Heartbeat(t.Context(), "server-1")
+	require.Error(t, err)
+	require.ErrorIs(t, err, fc.getServerErr)
+}
+
+// Suspend/Resume must satisfy provider.InstanceGroup, but Init never
+// advertises provider.CapabilitySuspendResume, so the runner's provisioner
+// never actually calls them. Pin that they report "not supported" rather
+// than silently pretending to succeed.
+func TestSuspendResume_ReportNotSupported(t *testing.T) {
+	g := newTestGroup(newFakeClient(), nil)
+
+	succeeded, err := g.Suspend(t.Context(), []string{"server-1"})
+	require.Nil(t, succeeded)
+	require.ErrorIs(t, err, provider.ErrSuspendResumeNotSupported)
+
+	succeeded, err = g.Resume(t.Context(), []string{"server-1"})
+	require.Nil(t, succeeded)
+	require.ErrorIs(t, err, provider.ErrSuspendResumeNotSupported)
 }

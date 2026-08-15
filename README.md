@@ -102,10 +102,11 @@ port API requires security group **UUIDs**, not names, so when
 | `username`               | `unset`  |
 | `use_static_credentials` | `false`  |
 
-When `use_ignition = true` and `username` is left unset, the plugin falls
-back to the image's `os_admin_user` metadata property. If neither is set,
-instance creation fails with a clear error rather than silently using the
-wrong user.
+When `username` is left unset, the plugin falls back to the image's
+`os_admin_user` metadata property. The same account is used both to
+authorize the plugin's SSH key (via Ignition) and to open the connection,
+so the two cannot drift apart. If neither is set, the plugin fails with a
+clear error rather than silently using the wrong user.
 
 
 OpenStack setup

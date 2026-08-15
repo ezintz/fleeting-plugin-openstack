@@ -2,6 +2,7 @@ package fpoc
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gitlab.com/gitlab-org/fleeting/fleeting/provider"
 
 	"github.com/ezintz/fleeting-plugin-openstack/internal/openstackclient"
 )
@@ -29,6 +31,10 @@ type fakeClient struct {
 	deletePortCalls   []string
 
 	createServerErr error
+
+	// server, when set, is returned by GetServer — lets ConnectInfo tests
+	// present an instance that has reached ACTIVE with an address.
+	server *servers.Server
 }
 
 type createPortCall struct {
@@ -82,6 +88,9 @@ func (f *fakeClient) ShowServerConsoleOutput(_ context.Context, _ string) (strin
 	return "", nil
 }
 func (f *fakeClient) GetServer(_ context.Context, _ string) (*servers.Server, error) {
+	if f.server != nil {
+		return f.server, nil
+	}
 	return &servers.Server{}, nil
 }
 func (f *fakeClient) ListServers(_ context.Context) ([]servers.Server, error) { return nil, nil }
@@ -224,6 +233,108 @@ func TestCreateInstance_SubnetIDPortNoSecurityGroupsWhenUnset(t *testing.T) {
 	require.Len(t, fc.createPortCalls, 1)
 	assert.Nil(t, fc.createPortCalls[0].SecurityGroups,
 		"when no security_groups are configured the plugin must not pass an empty list (which would mean 'attach no SGs at all')")
+}
+
+// newConnectInfoGroup builds a group whose single instance is ACTIVE and
+// addressable, ready for ConnectInfo to be called against it.
+func newConnectInfoGroup(t *testing.T) (*fakeClient, *InstanceGroup) {
+	t.Helper()
+
+	fc := newFakeClient()
+	fc.server = &servers.Server{ID: "server-1", Status: "ACTIVE", AccessIPv4: "10.0.0.5"}
+
+	g := newTestGroup(fc, nil)
+	g.UseIgnition = true
+
+	return fc, g
+}
+
+// createInstance authorizes the plugin's SSH key for os_admin_user when no
+// username is configured, but ConnectInfo used to report g.settings.Username
+// verbatim — i.e. "" — so the connector dialed with an empty SSH user and
+// authentication failed. fleeting's own acceptance suite guards this with
+// require.NotEmpty(t, info.Username).
+func TestConnectInfo_UsernameFallsBackToOSAdminUser(t *testing.T) {
+	_, g := newConnectInfoGroup(t)
+	g.settings = provider.Settings{} // connector_config.username deliberately unset
+	g.imgProps.Store(&openstackclient.ImageProperties{OSAdminUser: "core"})
+
+	info, err := g.ConnectInfo(context.Background(), "server-1")
+	require.NoError(t, err)
+
+	assert.Equal(t, "core", info.Username)
+	assert.Equal(t, "10.0.0.5", info.ExternalAddr)
+}
+
+// An explicitly configured username must win over the image property.
+func TestConnectInfo_ConfiguredUsernameWinsOverOSAdminUser(t *testing.T) {
+	_, g := newConnectInfoGroup(t)
+	g.settings = provider.Settings{
+		ConnectorConfig: provider.ConnectorConfig{Username: "operator"},
+	}
+	g.imgProps.Store(&openstackclient.ImageProperties{OSAdminUser: "core"})
+
+	info, err := g.ConnectInfo(context.Background(), "server-1")
+	require.NoError(t, err)
+
+	assert.Equal(t, "operator", info.Username)
+}
+
+// With neither source available, fail loudly rather than handing the
+// connector an empty user that dies with an opaque SSH error.
+func TestConnectInfo_ErrorsWhenNoUsernameAvailable(t *testing.T) {
+	_, g := newConnectInfoGroup(t)
+	g.settings = provider.Settings{}
+	g.imgProps.Store(&openstackclient.ImageProperties{})
+
+	_, err := g.ConnectInfo(context.Background(), "server-1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "os_admin_user")
+}
+
+// The same fallback must drive the Ignition key injection, so the account
+// the key is authorized for matches the one ConnectInfo reports.
+func TestCreateInstance_IgnitionUsesOSAdminUserForKeyInjection(t *testing.T) {
+	fc := newFakeClient()
+	g := newTestGroup(fc, nil)
+	g.UseIgnition = true
+	g.sshPubKey = "ssh-rsa AAAAB3NzaC1yc2E test"
+	g.settings = provider.Settings{}
+	g.imgProps.Store(&openstackclient.ImageProperties{OSAdminUser: "core"})
+
+	_, err := g.createInstance(context.Background())
+	require.NoError(t, err)
+
+	require.Len(t, fc.createServerCalls, 1)
+
+	// gophercloud base64-encodes user_data into the create payload, so
+	// decode it back to the Ignition config before inspecting it.
+	raw, err := json.Marshal(fc.createServerCalls[0].SpecMap)
+	require.NoError(t, err)
+	var parsed struct {
+		Server struct {
+			UserData string `json:"user_data"`
+		} `json:"server"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &parsed))
+	require.NotEmpty(t, parsed.Server.UserData)
+
+	ign, err := base64.StdEncoding.DecodeString(parsed.Server.UserData)
+	require.NoError(t, err)
+
+	var cfg struct {
+		Passwd struct {
+			Users []struct {
+				Name              string   `json:"name"`
+				SSHAuthorizedKeys []string `json:"sshAuthorizedKeys"`
+			} `json:"users"`
+		} `json:"passwd"`
+	}
+	require.NoError(t, json.Unmarshal(ign, &cfg))
+	require.Len(t, cfg.Passwd.Users, 1)
+	assert.Equal(t, "core", cfg.Passwd.Users[0].Name,
+		"the key must be authorized for the same account ConnectInfo reports")
+	assert.Equal(t, []string{g.sshPubKey}, cfg.Passwd.Users[0].SSHAuthorizedKeys)
 }
 
 func TestCreateInstance_CleanupPortsOnServerFailure(t *testing.T) {

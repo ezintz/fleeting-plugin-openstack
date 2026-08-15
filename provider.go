@@ -173,7 +173,7 @@ func (g *InstanceGroup) Increase(ctx context.Context, delta int) (succeeded int,
 	for idx := 0; idx < delta; idx++ {
 		id, err2 := g.createInstance(ctx)
 		if err2 != nil {
-			g.log.Error("Failed to create instance", "err", err)
+			g.log.Error("Failed to create instance", "err", err2)
 			err = errors.Join(err, err2)
 		} else {
 			g.log.Info("Instance creation request successful", "id", id)
@@ -298,16 +298,12 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 	}
 
 	if g.UseIgnition {
-		username := g.settings.Username
-		if username == "" {
-			imgProps := g.imgProps.Load()
-			if imgProps.OSAdminUser == "" {
-				return "", fmt.Errorf("image properties 'os_admin_user' and 'runners.autoscaler.connector_config.username' missing; ensure one is set")
-			}
-			username = imgProps.OSAdminUser
+		username, err := g.resolveUsername()
+		if err != nil {
+			return "", err
 		}
 
-		err := InsertSSHKeyIgn(spec, username, g.sshPubKey)
+		err = InsertSSHKeyIgn(spec, username, g.sshPubKey)
 		if err != nil {
 			return "", err
 		}
@@ -362,6 +358,31 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 	return srv.ID, nil
 }
 
+// resolveUsername returns the account instances in this group are reached
+// as: the operator-supplied connector_config.username if set, otherwise the
+// image's os_admin_user property.
+//
+// createInstance (which authorizes the plugin's key for this account via
+// Ignition) and ConnectInfo (which hands the account to the SSH connector)
+// must agree. Resolving in one place keeps them from drifting: previously
+// only createInstance applied the os_admin_user fallback, so ConnectInfo
+// reported an empty username and every SSH connection failed.
+func (g *InstanceGroup) resolveUsername() (string, error) {
+	if g.settings.Username != "" {
+		return g.settings.Username, nil
+	}
+
+	// Deliberately no built-in default: unlike EC2 ("ec2-user") or Azure
+	// ("azureuser"), OpenStack images have no conventional admin account
+	// (core, fedora, ubuntu, cloud-user, ...), so guessing would fail at
+	// SSH time with a far less obvious error than this one.
+	if imgProps := g.imgProps.Load(); imgProps != nil && imgProps.OSAdminUser != "" {
+		return imgProps.OSAdminUser, nil
+	}
+
+	return "", fmt.Errorf("image properties 'os_admin_user' and 'runners.autoscaler.connector_config.username' missing; ensure one is set")
+}
+
 // cleanupPorts deletes a list of pre-created ports, logging any errors.
 func (g *InstanceGroup) cleanupPorts(ctx context.Context, portIDs []string) {
 	for _, portID := range portIDs {
@@ -405,6 +426,13 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (pro
 		ExternalAddr:    ipAddr,
 	}
 	info.Protocol = provider.ProtocolSSH
+
+	// The connector passes this straight to ssh.ClientConfig.User, so an
+	// empty value fails authentication rather than defaulting to anything.
+	info.Username, err = g.resolveUsername()
+	if err != nil {
+		return provider.ConnectInfo{}, err
+	}
 
 	imgProps := g.imgProps.Load()
 

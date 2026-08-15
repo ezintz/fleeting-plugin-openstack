@@ -4,6 +4,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/caarlos0/env/v11"
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/testhelper"
 	thclient "github.com/gophercloud/gophercloud/v2/testhelper/client"
@@ -83,4 +84,40 @@ func TestGetImageByName_Many(t *testing.T) {
 	ctx := t.Context()
 	_, _, err = client.GetImageByName(ctx, "flatcar")
 	assert.ErrorIs(err, gophercloud.ErrMultipleResourcesFound{Name: "flatcar", Count: 8, ResourceType: "image"})
+}
+
+// env.Parse applies an envDefault by overwriting whatever the field already
+// holds, and New calls it after Init has copied the plugin's
+// nova_microversion in. An envDefault on ComputeAPIVersion therefore
+// discarded that value whenever OS_COMPUTE_API_VERSION was unset — silently,
+// with the operator's configured microversion never reaching Nova.
+func TestHTTPOpts_MicroversionPrecedence(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured string
+		envValue   string
+		want       string
+	}{
+		{"nothing set falls back to the default", "", "", DefaultComputeAPIVersion},
+		{"plugin config is honoured", "2.96", "", "2.96"},
+		{"env var overrides the plugin config", "2.96", "2.90", "2.90"},
+		{"env var alone is honoured", "", "2.90", "2.90"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.envValue != "" {
+				t.Setenv("OS_COMPUTE_API_VERSION", tc.envValue)
+			} else {
+				t.Setenv("OS_COMPUTE_API_VERSION", "")
+				os.Unsetenv("OS_COMPUTE_API_VERSION")
+			}
+
+			cfg := &EnvCloudConfig{CloudConfig: CloudConfig{ComputeAPIVersion: tc.configured}}
+			require.NoError(t, env.Parse(cfg))
+
+			_, got := cfg.HTTPOpts()
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }

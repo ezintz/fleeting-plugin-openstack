@@ -36,7 +36,7 @@ The following parameters are supported:
 | `clouds_config`       | string | Optional. Path to clouds.yaml |
 | `auth_from_env`       | bool   | Optional. Use environment variables for authentication |
 | `name`                | string | Name of the Auto Scaling Group (unique string that used to find instances) |
-| `nova_microversion`   | string | Optional. Microversion for the Openstack Nova client. Default 2.79 (which should be ok for Train+) |
+| `nova_microversion`   | string | Optional. Microversion for the Openstack Nova client. Defaults to 2.79 (fine for Train+). `OS_COMPUTE_API_VERSION` overrides this setting. |
 | `boot_time`           | string | Optional. Maximum wait time for instance to boot up. During that time plugin check Cloud-Init signatures. |
 | `use_ignition`        | string | Enable Fedora CoreOS / Flatcar Linux Ignition support |
 | `server_spec`         | object | Server spec used to create instances. See: [Compute API](https://docs.openstack.org/api-ref/compute/#create-server) |

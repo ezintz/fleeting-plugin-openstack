@@ -4,6 +4,7 @@
 package openstackclient
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -42,12 +43,19 @@ type CloudOpts struct {
 // CloudConfig selects a named cloud from a clouds.yaml file. Each field may
 // also be supplied through its OS_* environment variable.
 type CloudConfig struct {
-	ClientConfigFile  string `json:"client-config-file" env:"OS_CLIENT_CONFIG_FILE"`
-	Cloud             string `json:"cloud" env:"OS_CLOUD"`
-	RegionName        string `json:"region-name" env:"OS_REGION_NAME"`
-	EndpointType      string `json:"endpoint-type" env:"OS_ENDPOINT_TYPE"`
-	Debug             bool   `json:"debug" env:"OS_DEBUG"`
-	ComputeAPIVersion string `json:"compute-api-version" env:"OS_COMPUTE_API_VERSION" envDefault:"2.79"`
+	ClientConfigFile string `json:"client-config-file" env:"OS_CLIENT_CONFIG_FILE"`
+	Cloud            string `json:"cloud" env:"OS_CLOUD"`
+	RegionName       string `json:"region-name" env:"OS_REGION_NAME"`
+	EndpointType     string `json:"endpoint-type" env:"OS_ENDPOINT_TYPE"`
+	Debug            bool   `json:"debug" env:"OS_DEBUG"`
+	// Deliberately no envDefault. env.Parse applies an envDefault by
+	// *overwriting* whatever the field already holds, and New calls it
+	// after the caller has populated this struct — so an envDefault here
+	// silently discarded the operator's nova_microversion whenever
+	// OS_COMPUTE_API_VERSION was unset, which is to say almost always.
+	// The default is applied in HTTPOpts instead, where it can only fill
+	// in a value nobody supplied.
+	ComputeAPIVersion string `json:"compute-api-version" env:"OS_COMPUTE_API_VERSION"`
 }
 
 // EnvCloudConfig authenticates from OS_* environment variables. If Cloud is
@@ -159,9 +167,18 @@ func New(ctx context.Context, authConfig AuthConfig, cloudOpts *CloudOpts) (Clie
 	}, nil
 }
 
+// DefaultComputeAPIVersion is the Nova microversion negotiated when neither
+// the plugin config nor OS_COMPUTE_API_VERSION names one. It has to be a
+// real version: gophercloud's RequireMicroversion cannot parse "" and fails
+// Init outright.
+const DefaultComputeAPIVersion = "2.79"
+
 // HTTPOpts reports the debug flag and the Nova microversion to negotiate.
+//
+// Precedence is OS_COMPUTE_API_VERSION, then the plugin's
+// nova_microversion, then DefaultComputeAPIVersion.
 func (cloudConfig *CloudConfig) HTTPOpts() (debug bool, computeAPIVersion string) {
-	return cloudConfig.Debug, cloudConfig.ComputeAPIVersion
+	return cloudConfig.Debug, cmp.Or(cloudConfig.ComputeAPIVersion, DefaultComputeAPIVersion)
 }
 
 // Parse resolves credentials and endpoint options from the selected cloud in

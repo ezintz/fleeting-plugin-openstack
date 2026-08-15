@@ -160,14 +160,23 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 		lg := g.log.With("server_id", srv.ID, "created", srv.Created, "status", srv.Status)
 
 		switch srv.Status {
-		case "BUILD", "MIGRATING", "PAUSED", "REBUILD":
-			// pass
+		case "BUILD", "MIGRATING", "PAUSED", "REBUILD",
+			"REBOOT", "HARD_REBOOT", "RESIZE", "VERIFY_RESIZE", "REVERT_RESIZE", "RESCUE", "PASSWORD":
+			// Transient: Nova is doing something to the instance and it
+			// is expected to land back in ACTIVE (or ERROR) on its own.
+			// Report StateCreating so the runner stops scheduling onto it
+			// without the plugin destroying a machine that is coming back.
 
-		case "DELETED", "SHUTOFF", "UNKNOWN", "ERROR":
+		case "DELETED", "SHUTOFF", "UNKNOWN", "ERROR",
+			"SOFT_DELETED", "SUSPENDED", "SHELVED", "SHELVED_OFFLOADED":
 			// Nova has either given up on this instance (ERROR) or it will
 			// never come back to a usable state on its own (SHUTOFF,
 			// UNKNOWN, and DELETED — the last can still show up briefly
-			// here since ListServers doesn't guarantee it's gone yet).
+			// here since ListServers doesn't guarantee it's gone yet;
+			// SOFT_DELETED is awaiting reclaim; SUSPENDED, SHELVED and
+			// SHELVED_OFFLOADED need an explicit resume/unshelve the
+			// plugin never issues, since Init does not advertise
+			// CapabilitySuspendResume).
 			//
 			// The runner never asks us to remove an instance on its own
 			// initiative: Decrease is only called for instances an operator
@@ -226,6 +235,15 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 					lg.Debug("Instance boot time not passed and cloud-init/ignition not finished", "boot_time", g.BootTime)
 				}
 			}
+
+		default:
+			// A status no Nova release this plugin has seen produces.
+			// Treat it as transient rather than deleting a machine we
+			// don't understand, but say so: an instance parked here is
+			// reported StateCreating on every cycle, and nothing prunes a
+			// StateCreating instance that keeps showing up in the list, so
+			// it would otherwise occupy a slot in the group silently.
+			lg.Warn("Instance has an unrecognized status; treating it as still creating")
 		}
 
 		update(srv.ID, state)
@@ -457,7 +475,7 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (string, error) {
 			return "", err
 		}
 
-		err = InsertSSHKeyIgn(spec, username, g.sshPubKey)
+		err = InsertSSHKeyIgn(spec, username, g.sshPubKey, g.log)
 		if err != nil {
 			return "", err
 		}
@@ -644,20 +662,15 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (pro
 
 	imgProps := g.imgProps.Load()
 
-	// XXX TODO: srv.Image in many conditions may be empty, so you should go and check volume meta.
-	//           but for simplicity we just keep the last image and assume the props we want keeps the same...
-	// if imgProps == nil && srv.Image != nil {
-	// 	image := new(images.Image)
-	// 	err = mapstructure.Decode(srv.Image, image)
-	// 	if err != nil {
-	// 		return provider.ConnectInfo{}, err
-	// 	}
-	//
-	// 	imgProps, err = g.client.GetImageProperties(ctx, image.ID)
-	// 	if err != nil {
-	// 		return provider.ConnectInfo{}, err
-	// 	}
-	// }
+	// imgProps is whatever the last image resolution cached, not something
+	// re-derived per instance. Deriving it from the server would mean
+	// reading srv.Image, which Nova leaves empty for anything booted from a
+	// volume (which is every instance when volume_type/volume_size is set),
+	// so it would have to chase the volume's image metadata instead. All
+	// instances in a group share one server_spec and therefore one image,
+	// so the cached properties are right for all of them; the gap is only
+	// an instance the plugin adopted at Init after a restart, before any
+	// image lookup has happened, where the defaults below apply.
 
 	// Protocol/OS/Arch come from runners.autoscaler.connector_config
 	// (g.settings.ConnectorConfig, already copied into info above) when the

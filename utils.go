@@ -14,6 +14,7 @@ import (
 	"github.com/coreos/vcontext/report"
 	"github.com/go-viper/mapstructure/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
+	"github.com/hashicorp/go-hclog"
 )
 
 // PluginNetwork extends servers.Network with subnet selection support.
@@ -27,8 +28,9 @@ type PluginNetwork struct {
 	SubnetID string `json:"subnet_id,omitempty"`
 }
 
-// ExtCreateOpts extended version of servers.CreateOpts
-// nolint:revive
+// ExtCreateOpts is servers.CreateOpts plus the fields gophercloud has no
+// equivalent for: image/flavor lookup by name, a description, a key name,
+// scheduler hints, and networks that can name a subnet.
 type ExtCreateOpts struct {
 	servers.CreateOpts
 
@@ -274,7 +276,13 @@ func IsIgnitionFinished(log string) bool {
 // InsertSSHKeyIgn authorizes pubKey for username in the spec's Ignition
 // user_data, parsing and extending any config the operator supplied rather
 // than replacing it.
-func InsertSSHKeyIgn(spec *ExtCreateOpts, username, pubKey string) error {
+//
+// log receives the non-fatal findings of parsing that config — deprecations
+// and warnings. Ignition reports those separately from err (a fatal report
+// is what produces err in the first place), so discarding them, as this used
+// to, meant an operator whose user_data used a deprecated field got no
+// signal at all until the instance failed to boot. May be nil.
+func InsertSSHKeyIgn(spec *ExtCreateOpts, username, pubKey string, log hclog.Logger) error {
 	var cfg igntyp.Config
 	var err error
 
@@ -286,7 +294,11 @@ func InsertSSHKeyIgn(spec *ExtCreateOpts, username, pubKey string) error {
 			return fmt.Errorf("failed to parse ignition: %w", err)
 		}
 
-		_ = rpt
+		if log != nil {
+			for _, entry := range rpt.Entries {
+				log.Warn("Ignition user_data", "kind", entry.Kind.String(), "entry", entry.String())
+			}
+		}
 	}
 
 	if cfg.Ignition.Version == "" {

@@ -1131,3 +1131,65 @@ func serverFieldFromCall(t *testing.T, call createServerCall, field string) any 
 
 	return parsed.Server[field]
 }
+
+// Statuses an instance cannot recover from on its own must be self-deleted,
+// the same as ERROR/SHUTOFF. SUSPENDED, SHELVED and SHELVED_OFFLOADED need
+// an explicit resume/unshelve the plugin never issues (Init doesn't
+// advertise CapabilitySuspendResume) and SOFT_DELETED is awaiting reclaim,
+// so without this they sat in StateCreating forever, holding a slot in the
+// group while nothing pruned them.
+func TestUpdate_UnrecoverableStatusesAreSelfDeleted(t *testing.T) {
+	for _, status := range []string{"SOFT_DELETED", "SUSPENDED", "SHELVED", "SHELVED_OFFLOADED"} {
+		t.Run(status, func(t *testing.T) {
+			fc := newFakeClient()
+			fc.listServersResult = []servers.Server{
+				{ID: "server-1", Status: status, Metadata: map[string]string{MetadataKey: "test-asg"}},
+			}
+			g := newTestGroup(fc, nil)
+
+			calls, err := collectUpdates(g, t)
+			require.NoError(t, err)
+			assert.Equal(t, []string{"server-1"}, fc.deletedServers())
+			assert.Equal(t, []updateCall{{"server-1", provider.StateDeleting}}, calls)
+		})
+	}
+}
+
+// A transient status means Nova is working on the instance and it is
+// expected back in ACTIVE. Report it as still creating so the runner stops
+// scheduling onto it, but do NOT destroy a machine that is coming back.
+func TestUpdate_TransientStatusesAreNotDeleted(t *testing.T) {
+	for _, status := range []string{
+		"BUILD", "MIGRATING", "PAUSED", "REBUILD",
+		"REBOOT", "HARD_REBOOT", "RESIZE", "VERIFY_RESIZE", "REVERT_RESIZE", "RESCUE", "PASSWORD",
+	} {
+		t.Run(status, func(t *testing.T) {
+			fc := newFakeClient()
+			fc.listServersResult = []servers.Server{
+				{ID: "server-1", Status: status, Metadata: map[string]string{MetadataKey: "test-asg"}},
+			}
+			g := newTestGroup(fc, nil)
+
+			calls, err := collectUpdates(g, t)
+			require.NoError(t, err)
+			assert.Empty(t, fc.deletedServers(), "a recoverable instance must not be destroyed")
+			assert.Equal(t, []updateCall{{"server-1", provider.StateCreating}}, calls)
+		})
+	}
+}
+
+// A status this plugin has never seen is reported as still creating rather
+// than deleted — destroying a machine we don't understand is the worse
+// failure — but it must not pass silently.
+func TestUpdate_UnrecognizedStatusIsReportedNotDeleted(t *testing.T) {
+	fc := newFakeClient()
+	fc.listServersResult = []servers.Server{
+		{ID: "server-1", Status: "SOME_FUTURE_STATUS", Metadata: map[string]string{MetadataKey: "test-asg"}},
+	}
+	g := newTestGroup(fc, nil)
+
+	calls, err := collectUpdates(g, t)
+	require.NoError(t, err)
+	assert.Empty(t, fc.deletedServers())
+	assert.Equal(t, []updateCall{{"server-1", provider.StateCreating}}, calls)
+}

@@ -199,7 +199,7 @@ func TestInsertSSHKeyIgn(t *testing.T) {
 				UserData: tc.userData,
 			}
 
-			err := InsertSSHKeyIgn(spec, "test", "testkey")
+			err := InsertSSHKeyIgn(spec, "test", "testkey", nil)
 			assert.NoError(err)
 			assert.Equal(tc.expected, spec.UserData)
 		})

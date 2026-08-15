@@ -8,5 +8,17 @@ import (
 )
 
 func main() {
-	plugin.Serve(&osplugin.InstanceGroup{})
+	// plugin.Main wraps Serve with the version/bootstrap CLI GitLab's
+	// container-based plugin installation flow expects: `bootstrap <repo>`
+	// installs this binary into the shared plugin directory image, and
+	// `version`/-version report build metadata. With no arguments (how the
+	// docker-autoscaler executor invokes the binary today) it falls through
+	// to Serve, same as before.
+	plugin.Main(&osplugin.InstanceGroup{}, plugin.VersionInfo{
+		Name:      "fleeting-plugin-openstack",
+		Version:   osplugin.Version,
+		Revision:  osplugin.Revision,
+		Reference: osplugin.Branch,
+		BuiltAt:   osplugin.BuildDate,
+	})
 }

@@ -152,13 +152,31 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 		case "BUILD", "MIGRATING", "PAUSED", "REBUILD":
 			// pass
 
-		case "DELETED", "SHUTOFF", "UNKNOWN":
-			state = provider.StateDeleting
+		case "DELETED", "SHUTOFF", "UNKNOWN", "ERROR":
+			// Nova has either given up on this instance (ERROR) or it will
+			// never come back to a usable state on its own (SHUTOFF,
+			// UNKNOWN, and DELETED — the last can still show up briefly
+			// here since ListServers doesn't guarantee it's gone yet).
+			//
+			// The runner never asks us to remove an instance on its own
+			// initiative: Decrease is only called for instances an operator
+			// explicitly requested removal of via the executor. Reporting
+			// StateTimeout here (as this used to) doesn't fix that either —
+			// the provisioner just stops tracking the instance without ever
+			// calling Decrease. Either way, without deleting it ourselves,
+			// a broken instance sits in the tenant, consuming quota and
+			// cost, forever. So the plugin cleans it up directly, the same
+			// way Decrease would.
+			if srv.Status == "ERROR" {
+				lg.Warn("Instance is in ERROR state; deleting it")
+			}
 
-		case "ERROR":
-			// unsure if that's proper way...
-			lg.Warn("Instance is in ERROR state. Marking as a timeout.")
-			state = provider.StateTimeout
+			if delErr := g.deleteInstance(ctx, srv.ID); delErr != nil {
+				lg.Error("Failed to delete broken instance", "err", delErr)
+				reterr = errors.Join(reterr, delErr)
+			}
+
+			state = provider.StateDeleting
 
 		case "ACTIVE":
 			if srv.Created.Add(g.BootTime).Before(time.Now()) {
@@ -222,36 +240,52 @@ func (g *InstanceGroup) Decrease(ctx context.Context, instances []string) (succe
 
 	succeeded = make([]string, 0, len(instances))
 	for _, id := range instances {
-		// Collect pre-created ports (identified by description) before
-		// deleting the server, so we can clean them up afterwards.
-		var portIDs []string
-		serverPorts, listErr := g.client.ListPortsByDeviceID(ctx, id)
-		if listErr != nil {
-			g.log.Warn("Failed to list ports for server", "id", id, "err", listErr)
-		} else {
-			for _, p := range serverPorts {
-				if p.Description == PortDescription {
-					portIDs = append(portIDs, p.ID)
-				}
-			}
-		}
-
-		err2 := g.client.DeleteServer(ctx, id)
-		if err2 != nil {
+		if err2 := g.deleteInstance(ctx, id); err2 != nil {
 			g.log.Error("Failed to delete instance", "err", err2, "id", id)
 			err = errors.Join(err, err2)
-		} else {
-			g.log.Info("Instance deletion request successful", "id", id)
-			succeeded = append(succeeded, id)
-
-			// Clean up pre-created ports after successful server deletion.
-			g.cleanupPorts(ctx, portIDs)
+			continue
 		}
+
+		g.log.Info("Instance deletion request successful", "id", id)
+		succeeded = append(succeeded, id)
 	}
 
 	g.log.Info("Decrease", "instances", instances)
 
 	return succeeded, err
+}
+
+// deleteInstance deletes id and cleans up its pre-created ports (matching
+// PortDescription). Port lookup happens before server deletion since
+// ListPortsByDeviceID needs the still-existing device. A 404 from
+// DeleteServer means id is already gone, which is treated as success so
+// callers don't have to special-case it.
+//
+// Shared by Decrease (runner-requested removal) and Update (the plugin's
+// own cleanup of instances Nova has abandoned; see the ERROR/SHUTOFF/
+// UNKNOWN case there).
+func (g *InstanceGroup) deleteInstance(ctx context.Context, id string) error {
+	// Collect pre-created ports (identified by description) before
+	// deleting the server, so we can clean them up afterwards.
+	var portIDs []string
+	serverPorts, listErr := g.client.ListPortsByDeviceID(ctx, id)
+	if listErr != nil {
+		g.log.Warn("Failed to list ports for server", "id", id, "err", listErr)
+	} else {
+		for _, p := range serverPorts {
+			if p.Description == PortDescription {
+				portIDs = append(portIDs, p.ID)
+			}
+		}
+	}
+
+	if err := g.client.DeleteServer(ctx, id); err != nil && !gophercloud.ResponseCodeIs(err, http.StatusNotFound) {
+		return err
+	}
+
+	g.cleanupPorts(ctx, portIDs)
+
+	return nil
 }
 
 func (g *InstanceGroup) getInstances(ctx context.Context) ([]servers.Server, error) {

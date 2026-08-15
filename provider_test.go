@@ -32,9 +32,15 @@ type fakeClient struct {
 	createPortCalls   []createPortCall
 	createServerCalls []createServerCall
 	deletePortCalls   []string
+	deleteServerCalls []string
 
 	createServerErr error
 	getServerErr    error
+
+	// deleteServerFunc, when set, overrides DeleteServer's return value —
+	// lets tests simulate DeleteServer failing (e.g. for the Update
+	// self-heal path) or a 404 (already gone).
+	deleteServerFunc func(serverID string) error
 
 	// deletePortFunc, when set, overrides DeletePort's return value — lets
 	// tests simulate Neutron's 409 conflict / 404 not-found responses
@@ -50,6 +56,10 @@ type fakeClient struct {
 	// server, when set, is returned by GetServer — lets ConnectInfo tests
 	// present an instance that has reached ACTIVE with an address.
 	server *servers.Server
+
+	// listServersResult, when set, is returned by ListServers — lets Update
+	// tests present a group's current instances.
+	listServersResult []servers.Server
 }
 
 type createPortCall struct {
@@ -130,8 +140,17 @@ func (f *fakeClient) GetServer(_ context.Context, _ string) (*servers.Server, er
 	}
 	return &servers.Server{}, nil
 }
-func (f *fakeClient) ListServers(_ context.Context) ([]servers.Server, error) { return nil, nil }
-func (f *fakeClient) DeleteServer(_ context.Context, _ string) error          { return nil }
+func (f *fakeClient) ListServers(_ context.Context) ([]servers.Server, error) {
+	return f.listServersResult, nil
+}
+
+func (f *fakeClient) DeleteServer(_ context.Context, serverID string) error {
+	f.deleteServerCalls = append(f.deleteServerCalls, serverID)
+	if f.deleteServerFunc != nil {
+		return f.deleteServerFunc(serverID)
+	}
+	return nil
+}
 func (f *fakeClient) ListPortsByDeviceID(_ context.Context, deviceID string) ([]ports.Port, error) {
 	return f.portsByDevice[deviceID], nil
 }
@@ -622,4 +641,95 @@ func TestDecrease_PortCleanupRetriesConflictThenSucceeds(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{id}, succeeded)
 	assert.Equal(t, 2, attempts)
+}
+
+// updateCall records one (id, state) pair reported through Update's
+// callback.
+type updateCall struct {
+	ID    string
+	State provider.State
+}
+
+func collectUpdates(g *InstanceGroup, t *testing.T) ([]updateCall, error) {
+	t.Helper()
+	var calls []updateCall
+	err := g.Update(t.Context(), func(id string, state provider.State) {
+		calls = append(calls, updateCall{id, state})
+	})
+	return calls, err
+}
+
+// A Nova instance that reaches ERROR will never become usable again, and
+// GitLab Runner's provisioner only calls Decrease for instances an operator
+// explicitly requested removal of — it never acts on its own initiative
+// just because Update reports a bad state. Without deleting it itself, the
+// plugin would leak the instance forever. This is the fix for reporting it
+// as StateTimeout, which had the exact same leak (see deleteInstance).
+func TestUpdate_ErrorInstanceIsSelfDeleted(t *testing.T) {
+	fc := newFakeClient()
+	fc.listServersResult = []servers.Server{
+		{ID: "server-1", Status: "ERROR", Metadata: map[string]string{MetadataKey: "test-asg"}},
+	}
+	g := newTestGroup(fc, nil)
+
+	calls, err := collectUpdates(g, t)
+	require.NoError(t, err)
+
+	require.Equal(t, []string{"server-1"}, fc.deleteServerCalls, "ERROR instance must be deleted by the plugin itself")
+	require.Equal(t, []updateCall{{"server-1", provider.StateDeleting}}, calls)
+}
+
+// SHUTOFF and UNKNOWN instances are equally abandoned by Nova and equally
+// invisible to the runner's own removal logic, so they must be self-deleted
+// too, not just relabeled.
+func TestUpdate_ShutoffAndUnknownInstancesAreSelfDeleted(t *testing.T) {
+	for _, status := range []string{"SHUTOFF", "UNKNOWN"} {
+		t.Run(status, func(t *testing.T) {
+			fc := newFakeClient()
+			fc.listServersResult = []servers.Server{
+				{ID: "server-1", Status: status, Metadata: map[string]string{MetadataKey: "test-asg"}},
+			}
+			g := newTestGroup(fc, nil)
+
+			calls, err := collectUpdates(g, t)
+			require.NoError(t, err)
+
+			require.Equal(t, []string{"server-1"}, fc.deleteServerCalls)
+			require.Equal(t, []updateCall{{"server-1", provider.StateDeleting}}, calls)
+		})
+	}
+}
+
+// A pre-created port on a broken instance must be cleaned up the same way
+// Decrease would clean it up, including the async-teardown retry.
+func TestUpdate_ErrorInstanceCleansUpItsPorts(t *testing.T) {
+	fc := newFakeClient()
+	fc.portsByDevice = map[string][]ports.Port{
+		"server-1": {{ID: "port-1", Description: PortDescription}},
+	}
+	fc.listServersResult = []servers.Server{
+		{ID: "server-1", Status: "ERROR", Metadata: map[string]string{MetadataKey: "test-asg"}},
+	}
+	g := newTestGroup(fc, nil)
+
+	_, err := collectUpdates(g, t)
+	require.NoError(t, err)
+	require.Equal(t, []string{"port-1"}, fc.deletePortCalls)
+}
+
+// If DeleteServer itself fails, Update must still report StateDeleting (so
+// the instance stays tracked and gets retried next cycle instead of being
+// silently dropped) and surface the failure so it's not swallowed.
+func TestUpdate_ErrorInstanceDeleteFailureIsReportedButStillRetried(t *testing.T) {
+	fc := newFakeClient()
+	wantErr := errors.New("nova unavailable")
+	fc.deleteServerFunc = func(string) error { return wantErr }
+	fc.listServersResult = []servers.Server{
+		{ID: "server-1", Status: "ERROR", Metadata: map[string]string{MetadataKey: "test-asg"}},
+	}
+	g := newTestGroup(fc, nil)
+
+	calls, err := collectUpdates(g, t)
+	require.ErrorIs(t, err, wantErr)
+	require.Equal(t, []updateCall{{"server-1", provider.StateDeleting}}, calls)
 }

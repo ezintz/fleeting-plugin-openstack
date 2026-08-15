@@ -733,3 +733,55 @@ func TestUpdate_ErrorInstanceDeleteFailureIsReportedButStillRetried(t *testing.T
 	require.ErrorIs(t, err, wantErr)
 	require.Equal(t, []updateCall{{"server-1", provider.StateDeleting}}, calls)
 }
+
+// runners.autoscaler.connector_config lets an operator set protocol/os/arch
+// explicitly. ConnectInfo must treat those as an override, not a default
+// that image-property detection is free to clobber — matching the
+// precedence resolveUsername already applies to Username.
+func TestConnectInfo_OperatorProtocolOverridesImageDetection(t *testing.T) {
+	g := newConnectInfoGroup(t)
+	g.settings.Protocol = provider.ProtocolWinRM
+	g.imgProps.Store(&openstackclient.ImageProperties{OSType: "linux", OSAdminUser: "core"})
+
+	info, err := g.ConnectInfo(t.Context(), "server-1")
+	require.NoError(t, err)
+	assert.Equal(t, provider.ProtocolWinRM, info.Protocol, "operator-configured protocol must not be overwritten by linux image detection")
+}
+
+func TestConnectInfo_OperatorOSAndArchOverrideImageDetection(t *testing.T) {
+	g := newConnectInfoGroup(t)
+	g.settings.OS = "freebsd"
+	g.settings.Arch = "arm64"
+	g.imgProps.Store(&openstackclient.ImageProperties{OSType: "linux", Architecture: "x86_64", OSAdminUser: "core"})
+
+	info, err := g.ConnectInfo(t.Context(), "server-1")
+	require.NoError(t, err)
+	assert.Equal(t, "freebsd", info.OS)
+	assert.Equal(t, "arm64", info.Arch)
+}
+
+// Without an operator override, image properties still drive OS/Arch/
+// Protocol detection exactly as before.
+func TestConnectInfo_ImageDetectionFillsUnsetFields(t *testing.T) {
+	g := newConnectInfoGroup(t)
+	g.imgProps.Store(&openstackclient.ImageProperties{OSType: "windows", Architecture: "aarch64", OSAdminUser: "Administrator"})
+
+	info, err := g.ConnectInfo(t.Context(), "server-1")
+	require.NoError(t, err)
+	assert.Equal(t, provider.ProtocolWinRM, info.Protocol)
+	assert.Equal(t, "windows", info.OS)
+	assert.Equal(t, "arm64", info.Arch)
+}
+
+// No image properties at all (e.g. image_name/image_ref_from_metadata
+// unset) still defaults to linux/amd64/ssh.
+func TestConnectInfo_NoImagePropertiesDefaultsToLinuxAmd64SSH(t *testing.T) {
+	g := newConnectInfoGroup(t)
+	g.settings.Username = "core"
+
+	info, err := g.ConnectInfo(t.Context(), "server-1")
+	require.NoError(t, err)
+	assert.Equal(t, provider.ProtocolSSH, info.Protocol)
+	assert.Equal(t, "linux", info.OS)
+	assert.Equal(t, "amd64", info.Arch)
+}

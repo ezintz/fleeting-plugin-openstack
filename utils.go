@@ -1,10 +1,12 @@
 package fpoc
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"maps"
 	"regexp"
+	"slices"
 	"strings"
 
 	igncfg "github.com/coreos/ignition/v2/config/v3_4"
@@ -136,6 +138,61 @@ func extractAddresses(srv *servers.Server) (map[string][]Address, error) {
 	}
 
 	return ret, nil
+}
+
+// selectConnectAddress picks one address to connect to out of every address
+// extractAddresses found across all of an instance's networks.
+//
+// This has to be deterministic: netAddrs is a map, and Go deliberately
+// randomizes map iteration order, so picking "whichever address the range
+// loop visits last" (the previous approach) could return a different
+// network's address on every call — including one the runner can't
+// actually reach.
+//
+// Preference order: a floating (externally routable) address over a fixed
+// (tenant-internal) one — Nova's OS-EXT-IPS:type field distinguishes them —
+// then IPv4 over IPv6, then network name and address as a final,
+// arbitrary-but-stable tie-break. Returns "" if netAddrs has no addresses.
+func selectConnectAddress(netAddrs map[string][]Address) string {
+	type candidate struct {
+		network string
+		addr    Address
+	}
+
+	var candidates []candidate
+	for net, addrs := range netAddrs {
+		for _, addr := range addrs {
+			candidates = append(candidates, candidate{net, addr})
+		}
+	}
+
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	slices.SortFunc(candidates, func(a, b candidate) int {
+		return cmp.Or(
+			cmp.Compare(addressRank(a.addr), addressRank(b.addr)),
+			cmp.Compare(a.network, b.network),
+			cmp.Compare(a.addr.Address, b.addr.Address),
+		)
+	})
+
+	return candidates[0].addr.Address
+}
+
+// addressRank scores an address for selectConnectAddress; lower sorts
+// first. A floating address always outranks a fixed one regardless of IP
+// version, since reachability matters more than protocol preference.
+func addressRank(a Address) int {
+	rank := 0
+	if a.Type != "floating" {
+		rank += 2
+	}
+	if a.Version != 4 {
+		rank++
+	}
+	return rank
 }
 
 var (

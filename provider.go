@@ -531,13 +531,8 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (pro
 			return provider.ConnectInfo{}, err
 		}
 
-		// TODO: detect internal (tenant) and external networks
-		for net, addrs := range netAddrs {
-			for _, addr := range addrs {
-				ipAddr = addr.Address
-				g.log.Debug("Use address", "network", net, "ip_address", ipAddr)
-			}
-		}
+		ipAddr = selectConnectAddress(netAddrs)
+		g.log.Debug("Use address", "ip_address", ipAddr)
 	}
 
 	info := provider.ConnectInfo{
@@ -546,7 +541,6 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (pro
 		InternalAddr:    ipAddr,
 		ExternalAddr:    ipAddr,
 	}
-	info.Protocol = provider.ProtocolSSH
 
 	// The connector passes this straight to ssh.ClientConfig.User, so an
 	// empty value fails authentication rather than defaulting to anything.
@@ -572,36 +566,63 @@ func (g *InstanceGroup) ConnectInfo(ctx context.Context, instanceID string) (pro
 	// 	}
 	// }
 
+	// Protocol/OS/Arch come from runners.autoscaler.connector_config
+	// (g.settings.ConnectorConfig, already copied into info above) when the
+	// operator set them explicitly; everything below only fills in values
+	// info doesn't already have, the same precedence resolveUsername
+	// already applies to Username.
 	if imgProps != nil {
 		switch imgProps.OSType {
 		case "", "linux":
-			info.Protocol = provider.ProtocolSSH
-			info.OS = "linux"
+			if info.Protocol == "" {
+				info.Protocol = provider.ProtocolSSH
+			}
+			if info.OS == "" {
+				info.OS = "linux"
+			}
 
 		case "windows":
 			g.log.Warn("Windows not really supported by the plugin.")
-			info.Protocol = provider.ProtocolWinRM
-			info.OS = imgProps.OSType
+			if info.Protocol == "" {
+				info.Protocol = provider.ProtocolWinRM
+			}
+			if info.OS == "" {
+				info.OS = imgProps.OSType
+			}
 
 		default:
 			g.log.Warn("Unknown image os_type", "os_type", imgProps.OSType)
-			info.OS = imgProps.OSType
+			if info.OS == "" {
+				info.OS = imgProps.OSType
+			}
 		}
 
 		switch imgProps.Architecture {
 		case "", "x86_64":
-			info.Arch = "amd64"
+			if info.Arch == "" {
+				info.Arch = "amd64"
+			}
 
 		case "aarch64":
-			info.Arch = "arm64"
+			if info.Arch == "" {
+				info.Arch = "arm64"
+			}
 
 		default:
 			g.log.Warn("Unknown image arch", "arch", imgProps.Architecture)
 		}
 	} else {
 		// default to linux on amd64
-		info.OS = "linux"
-		info.Arch = "amd64"
+		if info.OS == "" {
+			info.OS = "linux"
+		}
+		if info.Arch == "" {
+			info.Arch = "amd64"
+		}
+	}
+
+	if info.Protocol == "" {
+		info.Protocol = provider.ProtocolSSH
 	}
 
 	return info, nil

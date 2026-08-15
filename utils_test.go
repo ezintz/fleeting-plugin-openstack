@@ -205,3 +205,63 @@ func TestInsertSSHKeyIgn(t *testing.T) {
 		})
 	}
 }
+
+// selectConnectAddress must be deterministic: Go deliberately randomizes map
+// iteration order, so running the same input repeatedly is how a regression
+// to "whichever address the range loop visits last" would actually show up.
+func TestSelectConnectAddress_Deterministic(t *testing.T) {
+	netAddrs := map[string][]Address{
+		"tenant-a": {{Address: "10.0.0.5", Version: 4, Type: "fixed"}},
+		"tenant-b": {{Address: "10.0.1.5", Version: 4, Type: "fixed"}},
+		"tenant-c": {{Address: "10.0.2.5", Version: 4, Type: "fixed"}},
+		"tenant-d": {{Address: "10.0.3.5", Version: 4, Type: "fixed"}},
+	}
+
+	first := selectConnectAddress(netAddrs)
+	for i := 0; i < 50; i++ {
+		require.Equal(t, first, selectConnectAddress(netAddrs), "must return the same address on every call for the same input")
+	}
+}
+
+func TestSelectConnectAddress_PrefersFloatingOverFixed(t *testing.T) {
+	netAddrs := map[string][]Address{
+		"tenant": {{Address: "10.0.0.5", Version: 4, Type: "fixed"}},
+		"public": {{Address: "203.0.113.9", Version: 4, Type: "floating"}},
+	}
+
+	assert.Equal(t, "203.0.113.9", selectConnectAddress(netAddrs))
+}
+
+func TestSelectConnectAddress_FloatingBeatsFixedRegardlessOfIPVersion(t *testing.T) {
+	netAddrs := map[string][]Address{
+		"tenant": {{Address: "10.0.0.5", Version: 4, Type: "fixed"}},
+		"public": {{Address: "2001:db8::1", Version: 6, Type: "floating"}},
+	}
+
+	assert.Equal(t, "2001:db8::1", selectConnectAddress(netAddrs), "reachability (floating) outranks IP version preference")
+}
+
+func TestSelectConnectAddress_PrefersIPv4OverIPv6WhenTypeTies(t *testing.T) {
+	netAddrs := map[string][]Address{
+		"dualstack": {
+			{Address: "2001:db8::1", Version: 6, Type: "fixed"},
+			{Address: "10.0.0.5", Version: 4, Type: "fixed"},
+		},
+	}
+
+	assert.Equal(t, "10.0.0.5", selectConnectAddress(netAddrs))
+}
+
+func TestSelectConnectAddress_TieBreaksByNetworkThenAddress(t *testing.T) {
+	netAddrs := map[string][]Address{
+		"net-b": {{Address: "10.0.1.5", Version: 4, Type: "fixed"}},
+		"net-a": {{Address: "10.0.0.9", Version: 4, Type: "fixed"}},
+	}
+
+	assert.Equal(t, "10.0.0.9", selectConnectAddress(netAddrs), "lowest network name wins when rank ties")
+}
+
+func TestSelectConnectAddress_EmptyReturnsEmptyString(t *testing.T) {
+	assert.Equal(t, "", selectConnectAddress(nil))
+	assert.Equal(t, "", selectConnectAddress(map[string][]Address{}))
+}

@@ -1,0 +1,48 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A [GitLab fleeting plugin](https://docs.gitlab.com/runner/executors/docker_autoscaler.html) for OpenStack — a Go binary that GitLab Runner's `docker-autoscaler` executor drives over the fleeting `plugin.Serve` RPC protocol to create/list/delete Nova instances as autoscaled CI runners. It's a fork combining features from `sardinasystems/fleeting-plugin-openstack` (base) and `hdacloud/fleeting-plugin-openstack` (boot-volume, flavor-by-name, image-by-metadata, `os_admin_user` SSH fallback), plus its own `networks[].subnet_id` support.
+
+## Commands
+
+```bash
+go test -v ./...              # run all tests (matches CI)
+go test -v -run TestName ./...  # run a single test
+go build -trimpath            # build (matches CI; add GOOS/GOARCH/CGO_ENABLED=0 to cross-compile)
+golangci-lint run              # lint (CI uses golangci-lint-action@v8, no committed config)
+```
+
+There is no Makefile. CI is three independent GitHub Actions workflows (`test.yml`, `lint.yml`, `build.yaml`), each running the equivalent command above.
+
+## Architecture
+
+- **`provider.go`** (package `fpoc`) — the core. `InstanceGroup` implements `gitlab.com/gitlab-org/fleeting/fleeting/provider.InstanceGroup`: `Init`, `Update`, `Increase`, `Decrease`, `ConnectInfo`, `Heartbeat`, `Suspend`, `Resume`, `Shutdown`. This is the whole plugin contract; everything else supports it. `Suspend`/`Resume` are unimplemented stubs (`provider.ErrSuspendResumeNotSupported`) since `Init` never advertises `provider.CapabilitySuspendResume`, so the runner's provisioner never calls them.
+- **`cmd/fleeting-plugin-openstack/main.go`** — thin binary entrypoint: `plugin.Main(&osplugin.InstanceGroup{}, plugin.VersionInfo{...})`, sourcing the version fields from `version.go`. With no arguments (how the docker-autoscaler executor invokes it) this falls through to the same `Serve` behavior as before; `version`/`-version` print build metadata and `bootstrap <repo>` installs the binary into GitLab's shared plugin directory for the container-based plugin installation flow.
+- **`internal/openstackclient/`** — wraps `gophercloud/v2` behind a `Client` interface (compute/image/network service clients). `provider.go` only talks to this interface, never to gophercloud directly, which is what makes `provider_test.go`'s hand-rolled `fakeClient` mock possible without a real OpenStack API. Auth is resolved from `clouds.yaml` (`cloud`/`clouds_config`) or `OS_*` env vars (`auth_from_env`), both parsed via the `AuthConfig` interface (`CloudConfig` vs `EnvCloudConfig`).
+- **`utils.go`** — `ExtCreateOpts` wraps gophercloud's `servers.CreateOpts` with plugin-only fields (`image_name`, `image_ref_from_metadata`, `flavor_name`, `key_name`, `description`, `scheduler_hints`) plus `PluginNetwork` (adds `subnet_id` to `servers.Network`). Also owns cloud-init/ignition boot-completion detection via regexes over console output, and `InsertSSHKeyIgn` (injects a dynamic SSH key into a parsed Ignition config for Flatcar/CoreOS).
+- **`connection_ssh.go`** — generates or reuses (from `provider.Settings.Key`) an RSA keypair for Ignition-mode instances; the public half gets injected via `InsertSSHKeyIgn`.
+- **`version.go`** — `Version`/`Revision`/`Branch`/`BuildUser`/`BuildDate` are `-ldflags -X` injection points, set by `.slsa-goreleaser/linux-*.yml` during release builds. Don't hardcode these.
+
+### Instance lifecycle (`provider.go`)
+
+- **Identity**: instances belong to a group by the `fleeting-cluster` metadata key (`MetadataKey`) matching `InstanceGroup.Name`; `getInstances` filters Nova's server list on this.
+- **Increase/createInstance**: deep-copies `ServerSpec` (via `jinzhu/copier`, since `spec.Networks` must not alias the source slice — see the comment in `createInstance`), formats `spec.Name` with an atomic per-call index, resolves `image_name`/`image_ref_from_metadata`/`flavor_name` against the API, injects the SSH key when `use_ignition`, pre-creates Neutron ports for any `networks[].subnet_id`, optionally appends a boot volume block device (`volume_type`+`volume_size`), then calls `CreateServer`. Any failure after port pre-creation triggers `cleanupPorts` to avoid leaking ports.
+- **Subnet support**: Nova's create-server API has no `subnet_id` field, so when a network entry specifies one, the plugin pre-creates a Neutron port on that subnet (tagged with `PortDescription` for later identification) and passes the port ID to Nova instead. `server_spec.security_groups` must be forwarded to that port explicitly (Nova won't retroactively apply server-level security groups to a pre-existing port) — and because the Neutron port API needs group **UUIDs** not names, `security_groups` must be UUIDs whenever any network uses `subnet_id`.
+- **Decrease**: for each instance, lists its ports first (matching `PortDescription`), deletes the server, then cleans up the pre-created ports — port lookup happens *before* server deletion since `ListPortsByDeviceID` needs the still-existing device. `DELETE /servers/{id}` answers before Nova finishes detaching those ports in the background, so `cleanupPorts` retries each `DeletePort` on a 409 (port still owned by the still-deleting server) for up to `portCleanupTimeout`, and treats 404 as success.
+- **Update**: maps Nova server status to `provider.State`; `ACTIVE` only becomes `StateRunning` once `boot_time` has elapsed *and* the console log shows cloud-init (`IsCloudInitFinished`) or Ignition (`IsIgnitionFinished`) completion — otherwise it's polled again next cycle. `ERROR`/`SHUTOFF`/`UNKNOWN`/`DELETED` instances are self-deleted via `deleteInstance` (shared with `Decrease`) rather than just relabeled: the runner's provisioner only ever calls `Decrease` for instances an operator explicitly requested removal of, never on its own initiative, so a broken instance the plugin doesn't delete itself leaks forever.
+- **ConnectInfo**: picks SSH vs WinRM and OS/arch from cached `ImageProperties` (captured at `Init` or at image resolution time in `createInstance`), not re-fetched per call — but only to fill in whatever `runners.autoscaler.connector_config` (`protocol`/`os`/`arch`) left unset; an operator-configured value always wins, same precedence as `resolveUsername`. The connect address itself goes through `selectConnectAddress` (deterministic: prefer a floating address over a fixed one, then IPv4 over IPv6) rather than an arbitrary map-iteration pick.
+
+### Testing
+
+- `provider_test.go` mocks `internal/openstackclient.Client` by hand (`fakeClient`) — no gophercloud/HTTP mocking needed since `provider.go` only depends on the `Client` interface.
+- `utils_test.go` exercises cloud-init/ignition detection against real captured console logs in `testdata/*.txt`, and image/flavor JSON fixtures in `testdata/*.json`.
+- `provider_integration_test.go`'s `TestProvisioning` is GitLab fleeting's black-box acceptance suite (`gitlab.com/gitlab-org/fleeting/fleeting/integration`): it builds the real binary and drives it through a `fleeting.Provisioner` exactly as the runner would (scale up, SSH in and run a command, scale to zero) against a **real OpenStack tenant**. It skips itself (not a build tag — a runtime `t.Skip`) unless both cloud credentials (`OS_CLOUD` or `OS_AUTH_URL`, the plugin's normal auth) and the `FLEETING_TEST_*` variables identifying what to provision (`FLEETING_TEST_IMAGE_NAME`, `FLEETING_TEST_FLAVOR_NAME`, `FLEETING_TEST_NETWORK_ID`, `FLEETING_TEST_KEY_NAME`, `FLEETING_TEST_SSH_KEY_FILE`, `FLEETING_TEST_SSH_USERNAME`) are set — there is no image/flavor/network that exists in every tenant the way a public-cloud SKU does, so it never runs in CI.
+
+### Gotchas
+
+- `go.mod` has a `replace github.com/mitchellh/mapstructure => github.com/go-viper/mapstructure v1.6.0` (see the linked gist in `go.mod`) — needed for compatibility between gophercloud's mapstructure usage and the plugin's own decoding.
+- `volume_size`/`volume_type` are mutually exclusive with a caller-defined `boot_index: 0` block device in `server_spec.block_device_mapping_v2`; `Init` rejects the config otherwise.
+- In Cloud-Init mode (`use_ignition = false`), `Init` requires `use_static_credentials = true` — there's no dynamic-key path outside Ignition.
